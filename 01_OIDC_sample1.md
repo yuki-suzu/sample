@@ -170,11 +170,6 @@ spring:
             issuer-uri: https://cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}
             user-name-attribute: username
 
-# アプリ設定
-app:
-  security:
-    default-provider-id: cognito
-
 ```
 
 ### JsonAuthenticationEntryPoint.java
@@ -188,10 +183,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.security.oauth2.client.OAuth2ClientProperties;
 import org.springframework.http.MediaType;
 import org.springframework.security.core.AuthenticationException;
 import org.springframework.security.oauth2.client.web.OAuth2AuthorizationRequestRedirectFilter;
+import org.springframework.security.oauth2.core.AuthorizationGrantType;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.stereotype.Component;
 
@@ -204,9 +200,7 @@ import java.util.Map;
 public class JsonAuthenticationEntryPoint implements AuthenticationEntryPoint {
 
     private final ObjectMapper objectMapper;
-
-    @Value("${app.security.default-provider-id}")
-    private String defaultProviderId;
+    private final OAuth2ClientProperties oauth2ClientProperties;
 
     @Override
     public void commence(HttpServletRequest request, HttpServletResponse response,
@@ -216,10 +210,21 @@ public class JsonAuthenticationEntryPoint implements AuthenticationEntryPoint {
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
 
-        // /oauth2/authorization/cognito を生成
-        String loginUrl = OAuth2AuthorizationRequestRedirectFilter.DEFAULT_AUTHORIZATION_REQUEST_BASE_URI 
-                          + "/" + defaultProviderId;
+        // 1. 設定の中から "authorization_code" (ユーザーログイン用) のものを探す
+        // client_credentials (M2M用) は除外される
+        String registrationId = oauth2ClientProperties.getRegistration().entrySet().stream()
+                .filter(entry -> AuthorizationGrantType.AUTHORIZATION_CODE.getValue()
+                        .equals(entry.getValue().getAuthorizationGrantType()))
+                .map(Map.Entry::getKey)
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("User login provider (authorization_code) not found in configuration"));
 
+        // 2. ログインURL生成
+        // 結果: /oauth2/authorization/cognito
+        String loginUrl = OAuth2AuthorizationRequestRedirectFilter.DEFAULT_AUTHORIZATION_REQUEST_BASE_URI 
+                          + "/" + registrationId;
+
+        // 3. JSON返却
         String jsonBody = objectMapper.writeValueAsString(Map.of("loginUrl", loginUrl));
         response.getWriter().write(jsonBody);
     }
