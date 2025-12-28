@@ -1,76 +1,238 @@
-ご提示いただいたフローは、**SPA（Angular）＋BFF（Spring Boot）** の構成において非常に理にかなった設計ですが、1点だけ**技術的な落とし穴（Step 2～3の挙動）**があります。
+承知いたしました。「Spring Session JDBC (PostgreSQL)」を利用する構成で、モダンな実装（Angular 17 Signals, Java 21, Spring Boot 3.2）に最適化した完全版を作成します。
 
-Ajax/Fetchリクエスト（AngularからのAPI呼び出し）に対して、サーバーが `302 Redirect` を返しても、**ブラウザは自動的にリダイレクト先（Cognito）のHTMLをAjaxのレスポンスとして取得しようとしてしまい、CORSエラーやパースエラーで失敗します**。画面遷移は起きません。
-
-そのため、Step 2～4の部分を少し調整し、「APIが401を返したら、Angularがブラウザをリダイレクトさせる」または「Angularの起動時（Guard）にセッションチェックを行い、なければログインエンドポイントへ遷移させる」形にするのが定石です。
-
-今回はご要望のフロー（特にStep 10以降のカスタムSuccessHandlerによるセッション構築）を実現するためのコードを提示します。
-
-### 実装のポイント
-
-1. **Spring (Backend):** `AuthenticationSuccessHandler` をカスタム実装し、認証後のリダイレクト先やフロント用セッション情報を制御します。
-2. **Angular (Frontend):** アプリ起動時（`APP_INITIALIZER`）にセッション情報取得APIを呼び出し、未ログインなら何もしない（あるいはログインへ）、ログイン済みなら保存されたURLへ遷移させます。
+バックエンドのコード自体は `HttpSession` インターフェースを使用するため大きな変更はありませんが、**依存関係と設定ファイル（application.yml）** が大きく変わります。また、DB層が加わることで考慮すべきパフォーマンスのポイントも最後にまとめました。
 
 ---
 
-### 1. Spring Boot 3.2 (Backend)
+## 1. 全体フローとアーキテクチャ
 
-#### SecurityConfig.java
+**基本構成 (BFFパターン + DB Session):**
 
-認証成功時のハンドラ（`customSuccessHandler`）を登録します。また、APIエンドポイント（`/ifs/**`）へのアクセスには認証を必須とします。
+1. **Angular (DMZ):** 認証ロジックを持たず、APIを叩くだけ。401なら指示されたURLへ飛ぶ。
+2. **Spring Boot (Trust):** OAuth2 Clientとして振る舞い、セッション情報を **PostgreSQL** に永続化する。
+3. **PostgreSQL:** `SPRING_SESSION` テーブル群でセッションデータを管理。
 
-```java
-package com.example.trustap.config;
+### 処理シーケンス
 
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.http.HttpStatus;
-import org.springframework.security.config.annotation.web.builders.HttpSecurity;
-import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
-import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
-import org.springframework.security.web.authentication.HttpStatusEntryPoint;
+1. **User:** ブラウザで `/ifs/hogehoge` にアクセス。
+2. **Angular:** API (`/api/ifs/data`) を実行。
+3. **Spring:** 未認証のため **401 Unauthorized** を返却。
+* Body: `{"loginUrl": "/oauth2/authorization/cognito"}` (動的生成)
 
-@Configuration
-@EnableWebSecurity
-public class SecurityConfig {
 
-    private final AuthenticationSuccessHandler customSuccessHandler;
+4. **Angular:**
+* Interceptorが401を検知。
+* 現在のパス `/ifs/hogehoge` を `sessionStorage` に保存。
+* レスポンスの `loginUrl` へリダイレクト。
 
-    public SecurityConfig(AuthenticationSuccessHandler customSuccessHandler) {
-        this.customSuccessHandler = customSuccessHandler;
+
+5. **Auth Flow:** Spring <-> Cognito 間で認証・認可。
+6. **Spring:** 認証成功 (`SuccessHandler`)。
+* ユーザー情報を構築し、`session.setAttribute` を実行。
+* **(内部処理):** セッションオブジェクトがシリアライズされ、PostgreSQLの `SPRING_SESSION` テーブルにINSERT/UPDATEされる。
+* ルート (`/`) へリダイレクト。
+
+
+7. **Angular:** アプリ再起動 (`APP_INITIALIZER`)。
+* `/api/ifs/session` をコール。
+* **(内部処理):** SpringがCookie (`JSESSIONID`) を元にPostgreSQLからセッションを復元。
+* ログイン情報を取得し、`sessionStorage` のパスへ遷移。
+
+
+
+---
+
+## 2. データベース準備 (PostgreSQL)
+
+Spring Session JDBCを利用するには、専用のテーブルが必要です。
+Spring Bootの設定で自動作成することも可能ですが、本番を見据えてDDLを把握しておくと良いです。
+
+```sql
+-- Spring Session 標準スキーマ (PostgreSQL用)
+CREATE TABLE SPRING_SESSION (
+	PRIMARY_ID CHAR(36) NOT NULL,
+	SESSION_ID CHAR(36) NOT NULL,
+	CREATION_TIME BIGINT NOT NULL,
+	LAST_ACCESS_TIME BIGINT NOT NULL,
+	MAX_INACTIVE_INTERVAL INT NOT NULL,
+	EXPIRY_TIME BIGINT NOT NULL,
+	PRINCIPAL_NAME VARCHAR(100),
+	CONSTRAINT SPRING_SESSION_PK PRIMARY KEY (PRIMARY_ID)
+);
+
+CREATE UNIQUE INDEX SPRING_SESSION_IX1 ON SPRING_SESSION (SESSION_ID);
+CREATE INDEX SPRING_SESSION_IX2 ON SPRING_SESSION (EXPIRY_TIME);
+CREATE INDEX SPRING_SESSION_IX3 ON SPRING_SESSION (PRINCIPAL_NAME);
+
+CREATE TABLE SPRING_SESSION_ATTRIBUTES (
+	SESSION_PRIMARY_ID CHAR(36) NOT NULL,
+	ATTRIBUTE_NAME VARCHAR(200) NOT NULL,
+	ATTRIBUTE_BYTES BYTEA NOT NULL,
+	CONSTRAINT SPRING_SESSION_ATTRIBUTES_PK PRIMARY KEY (SESSION_PRIMARY_ID, ATTRIBUTE_NAME),
+	CONSTRAINT SPRING_SESSION_ATTRIBUTES_FK FOREIGN KEY (SESSION_PRIMARY_ID) REFERENCES SPRING_SESSION(PRIMARY_ID) ON DELETE CASCADE
+);
+
+```
+
+---
+
+## 3. インフラ設定 (Nginx)
+
+Cookie（`JSESSIONID`）を正常に動作させるため、リバースプロキシ設定は必須です。
+
+**nginx.conf (DMZ Web Server)**
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name dmz-web.example.com;
+
+    # Angular アプリ
+    location / {
+        root /var/www/angular-app/browser;
+        index index.html;
+        try_files $uri $uri/ /index.html;
     }
 
-    @Bean
-    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
-        http
-            .csrf(csrf -> csrf.disable()) // 必要に応じてCookieCsrfTokenRepositoryを設定
-            .authorizeHttpRequests(auth -> auth
-                .requestMatchers("/ifs/session").permitAll() // セッション確認用は許可（または401でも可）
-                .requestMatchers("/ifs/**").authenticated()  // 業務APIは認証必須
-                .anyRequest().permitAll()                    // その他（index.html等）
-            )
-            // 未認証時の挙動: Ajaxリクエストに対してはログインページHTMLではなく401を返す
-            .exceptionHandling(ex -> ex
-                .authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED))
-            )
-            .oauth2Login(oauth2 -> oauth2
-                // 認証成功時のカスタムハンドラを登録 (Step 10)
-                .successHandler(customSuccessHandler)
-            );
+    # API & 認証プロキシ
+    # Cookieのドメイン問題を解決するため、同一ドメインに見せかける
+    location ~ ^/(api|login|oauth2)/ {
+        proxy_pass https://trust-api.example.com; 
+        
+        # パスとドメインの書き換え
+        proxy_cookie_path / /;
+        proxy_cookie_domain trust-api.example.com dmz-web.example.com;
 
-        return http.build();
+        # ヘッダ転送
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
 
 ```
 
-#### CustomAuthenticationSuccessHandler.java (Step 10の実装)
+---
 
-ここが核となる処理です。Cognitoからのコールバック後に実行されます。
+## 4. Spring Boot 3.2 (Trust AP) 実装
+
+### build.gradle
+
+PostgreSQLドライバとJDBCセッションを追加します。
+
+```groovy
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'org.springframework.boot:spring-boot-starter-oauth2-client'
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc' // JDBC
+    implementation 'org.springframework.session:spring-session-jdbc'   // Session JDBC
+    runtimeOnly 'org.postgresql:postgresql'                            // Postgres Driver
+    
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+}
+
+```
+
+### application.yml
+
+DB接続情報とセッション設定を記述します。
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://db-server:5432/mydb
+    username: myuser
+    password: mypassword
+  
+  # Session設定
+  session:
+    store-type: jdbc
+    jdbc:
+      # 起動時にテーブルがない場合作成する (本番ではnever推奨)
+      initialize-schema: always
+      # テーブル名を変える場合
+      # table-name: MY_SESSION
+  
+  security:
+    oauth2:
+      client:
+        registration:
+          cognito:
+            client-id: ${COGNITO_CLIENT_ID}
+            client-secret: ${COGNITO_CLIENT_SECRET}
+            scope: openid, profile, email
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+            authorization-grant-type: authorization_code
+        provider:
+          cognito:
+            issuer-uri: https://cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}
+            user-name-attribute: username
+
+# アプリ設定
+app:
+  security:
+    default-provider-id: cognito
+
+```
+
+### JsonAuthenticationEntryPoint.java
+
+401時にJSONを返し、Angularに次のアクション（リダイレクト先）を指示します。
 
 ```java
-package com.example.trustap.handler;
+package com.example.trustap.security;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.MediaType;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.oauth2.client.web.OAuth2AuthorizationRequestRedirectFilter;
+import org.springframework.security.web.AuthenticationEntryPoint;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+
+@Component
+@RequiredArgsConstructor
+public class JsonAuthenticationEntryPoint implements AuthenticationEntryPoint {
+
+    private final ObjectMapper objectMapper;
+
+    @Value("${app.security.default-provider-id}")
+    private String defaultProviderId;
+
+    @Override
+    public void commence(HttpServletRequest request, HttpServletResponse response,
+                         AuthenticationException authException) throws IOException {
+        
+        response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        response.setCharacterEncoding(StandardCharsets.UTF_8.name());
+
+        // /oauth2/authorization/cognito を生成
+        String loginUrl = OAuth2AuthorizationRequestRedirectFilter.DEFAULT_AUTHORIZATION_REQUEST_BASE_URI 
+                          + "/" + defaultProviderId;
+
+        String jsonBody = objectMapper.writeValueAsString(Map.of("loginUrl", loginUrl));
+        response.getWriter().write(jsonBody);
+    }
+}
+
+```
+
+### CustomAuthenticationSuccessHandler.java
+
+ログイン成功後、ユーザー情報をDB（Session）に保存し、トップへ戻します。
+
+```java
+package com.example.trustap.security;
 
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -93,72 +255,108 @@ public class CustomAuthenticationSuccessHandler implements AuthenticationSuccess
                                         Authentication authentication) throws IOException, ServletException {
         
         OAuth2User oAuth2User = (OAuth2User) authentication.getPrincipal();
-        HttpSession session = request.getSession();
+        HttpSession session = request.getSession(); // ここでDBセッションがロードまたは作成される
 
-        // Step 10-1: Cognito情報＋各種マスター情報の取得・作成
-        // ここでDB検索などを行い、フロントエンドに必要な情報を詰め込む
-        Map<String, Object> frontendSessionInfo = new HashMap<>();
-        frontendSessionInfo.put("username", oAuth2User.getAttribute("username"));
-        frontendSessionInfo.put("email", oAuth2User.getAttribute("email"));
-        frontendSessionInfo.put("role", "ADMIN"); // 例: DBから取得した権限情報
+        // フロントエンドに必要な情報を作成
+        Map<String, Object> frontSession = new HashMap<>();
+        frontSession.put("userId", oAuth2User.getAttribute("sub"));
+        frontSession.put("email", oAuth2User.getAttribute("email"));
         
-        // Sessionに保存
-        session.setAttribute("FRONT_SESSION_INFO", frontendSessionInfo);
+        // DBへ保存 (リクエスト終了時に自動コミット)
+        session.setAttribute("FRONT_SESSION_INFO", frontSession);
 
-        // Step 10-2: リダイレクト先URLの決定
-        // 注: 認証フロー開始時にAngularから "redirect_uri" パラメータなどで渡してもらうか、
-        // あるいはSessionに事前に保存しておいた "targetUrl" を取り出すのが一般的です。
-        // ここでは仮にSessionに保存されていたとして取り出します。
-        String targetUrl = (String) session.getAttribute("TARGET_URL");
-        if (targetUrl == null || targetUrl.isEmpty()) {
-            targetUrl = "/"; // デフォルト
-        }
-        
-        // フロント用Session情報にもリダイレクト先を含める（Step 12で返却するため）
-        frontendSessionInfo.put("redirectUrl", targetUrl);
-
-        // Step 10-3: ルート(/)へリダイレクト
-        // ブラウザのリダイレクトを行うため、ステータスコード200ではなく302でルートへ飛ばし、
-        // そこでAngularを再起動させるのが最も確実です。
+        // Angular再起動のためルートへリダイレクト
         response.sendRedirect("/");
     }
 }
 
 ```
 
-#### SessionController.java (Step 11, 12の実装)
+### SecurityConfig.java
 
-Angularが起動時に叩くAPIです。
+セキュリティ設定の集大成です。
+
+```java
+package com.example.trustap.config;
+
+import com.example.trustap.security.CustomAuthenticationSuccessHandler;
+import com.example.trustap.security.JsonAuthenticationEntryPoint;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
+import org.springframework.security.web.csrf.CsrfTokenRequestAttributeHandler;
+
+@Configuration
+@EnableWebSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JsonAuthenticationEntryPoint jsonEntryPoint;
+    private final CustomAuthenticationSuccessHandler successHandler;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            // CSRF: Cookieベース (Angularのデフォルトヘッダ X-XSRF-TOKEN に対応)
+            .csrf(csrf -> csrf
+                .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+                .csrfTokenRequestHandler(new CsrfTokenRequestAttributeHandler())
+            )
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/ifs/session").permitAll() // セッション確認は未認証でも通過させる
+                .requestMatchers("/api/ifs/**").authenticated()  // 業務APIは認証必須
+                .anyRequest().permitAll()
+            )
+            // 未認証時のハンドリング (JSON返却)
+            .exceptionHandling(ex -> ex
+                .authenticationEntryPoint(jsonEntryPoint)
+            )
+            // OAuth2 Login設定
+            .oauth2Login(oauth2 -> oauth2
+                .successHandler(successHandler)
+            );
+
+        return http.build();
+    }
+}
+
+```
+
+### SessionController.java
+
+セッション情報の取得API。
 
 ```java
 package com.example.trustap.controller;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpSession;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.util.Map;
-
 @RestController
-@RequestMapping("/ifs")
+@RequestMapping("/api/ifs")
 public class SessionController {
 
     @GetMapping("/session")
-    public ResponseEntity<?> getSessionInfo(HttpServletRequest request) {
+    public ResponseEntity<?> getSession(HttpServletRequest request) {
+        // false: セッションが無ければnullを返す (新規作成しない)
         HttpSession session = request.getSession(false);
         
-        if (session == null || session.getAttribute("FRONT_SESSION_INFO") == null) {
-            // セッションがない、または認証済みフラグがない
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        if (session != null) {
+            Object info = session.getAttribute("FRONT_SESSION_INFO");
+            if (info != null) {
+                return ResponseEntity.ok(info);
+            }
         }
-
-        // Sessionに保存しておいた情報を返却
-        Map<String, Object> info = (Map<String, Object>) session.getAttribute("FRONT_SESSION_INFO");
-        return ResponseEntity.ok(info);
+        // 未ログイン時は401 -> Angularはこれを見て何もしない(or ログイン画面へ)
+        return ResponseEntity.status(401).build();
     }
 }
 
@@ -166,38 +364,114 @@ public class SessionController {
 
 ---
 
-### 2. Angular 17.3 (Frontend)
+## 5. Angular 17.3 (DMZ Web) 実装
 
-Angularでは「起動時チェック」と「401ハンドリング」を実装します。
+### auth.types.ts
 
-#### auth.interceptor.ts
+バックエンドの返却型を定義。
 
-API実行時に401が返ってきたら、現在のURLを保存してからログイン処理（バックエンドへのリダイレクト）を行います。
+```typescript
+export interface SessionUser {
+  userId: string;
+  email: string;
+}
+
+export interface AuthErrorResponse {
+  loginUrl: string;
+}
+
+```
+
+### auth.service.ts
+
+ロジックの中枢。Signalを使用して状態管理を行います。
+
+```typescript
+import { Injectable, inject, signal, computed } from '@angular/core';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
+import { Router } from '@angular/router';
+import { tap, catchError, of, Observable } from 'rxjs';
+import { SessionUser, AuthErrorResponse } from './auth.types';
+
+@Injectable({
+  providedIn: 'root'
+})
+export class AuthService {
+  private http = inject(HttpClient);
+  private router = inject(Router);
+  private readonly STORAGE_KEY = 'redirect_target_url';
+
+  // ユーザー情報を保持するSignal
+  readonly currentUser = signal<SessionUser | null>(null);
+  
+  // ログイン状態を導出するSignal
+  readonly isLoggedIn = computed(() => !!this.currentUser());
+
+  /**
+   * 起動時に実行。セッション取得とURL復元を行う
+   */
+  checkSession(): Observable<SessionUser | null> {
+    return this.http.get<SessionUser>('/api/ifs/session').pipe(
+      tap(user => {
+        // ログイン成功: Signal更新 & URL復元
+        this.currentUser.set(user);
+        this.restoreRedirectUrl();
+      }),
+      catchError(() => {
+        // 未ログイン: Signalクリア
+        this.currentUser.set(null);
+        return of(null);
+      })
+    );
+  }
+
+  /**
+   * 401エラー時にInterceptorから呼ばれる
+   */
+  handleUnauthorized(error: HttpErrorResponse): void {
+    const errorBody = error.error as AuthErrorResponse;
+    if (errorBody?.loginUrl) {
+      // 1. 現在のURLを保存 (ルート以外の場合)
+      const currentUrl = window.location.pathname + window.location.search;
+      if (currentUrl !== '/') {
+        sessionStorage.setItem(this.STORAGE_KEY, currentUrl);
+      }
+      
+      // 2. 指定されたURLへリダイレクト
+      window.location.href = errorBody.loginUrl;
+    }
+  }
+
+  private restoreRedirectUrl(): void {
+    const targetUrl = sessionStorage.getItem(this.STORAGE_KEY);
+    if (targetUrl) {
+      sessionStorage.removeItem(this.STORAGE_KEY);
+      this.router.navigateByUrl(targetUrl);
+    }
+  }
+}
+
+```
+
+### auth.interceptor.ts
+
+401を監視するインターセプター。
 
 ```typescript
 import { HttpInterceptorFn, HttpErrorResponse } from '@angular/common/http';
 import { inject } from '@angular/core';
-import { Router } from '@angular/router';
-import { catchError, throwError } from 'rxjs';
+import { throwError } from 'rxjs';
+import { catchError } from 'rxjs/operators';
+import { AuthService } from './auth.service';
 
 export const authInterceptor: HttpInterceptorFn = (req, next) => {
+  const authService = inject(AuthService);
+
   return next(req).pipe(
     catchError((error: HttpErrorResponse) => {
-      // 401 Unauthorizedの場合
-      if (error.status === 401) {
-        // 現在のURL（本来行きたかった場所）を取得
-        // 例: /hogehoge
-        const targetUrl = window.location.pathname;
-
-        // Step 1～4の修正案:
-        // Ajaxで302は扱えないため、ここでブラウザをSpringのログインエンドポイントへ飛ばす
-        // 同時にターゲットURLをクエリパラメータ等で渡す（Spring側でこれをSessionに詰める処理が必要）
-        // 簡易実装として、SpringのLogin Endpointへ遷移
-        
-        // ※Spring側で事前にSession.setAttribute("TARGET_URL", targetUrl)するAPIを作って呼ぶか、
-        // ログインURLに ?state=... を含めるなどの工夫が必要です。
-        
-        window.location.href = `/oauth2/authorization/cognito`; 
+      // 401 かつ loginUrl がある場合のみ処理
+      if (error.status === 401 && error.error?.loginUrl) {
+        authService.handleUnauthorized(error);
       }
       return throwError(() => error);
     })
@@ -206,50 +480,38 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
 
 ```
 
-#### app.config.ts (Step 11: 起動時チェック)
+### app.config.ts
 
-`APP_INITIALIZER` を使い、Angularアプリが描画される前に `/ifs/session` を確認します。
+アプリ初期化処理。
 
 ```typescript
 import { ApplicationConfig, APP_INITIALIZER } from '@angular/core';
-import { provideRouter, Router } from '@angular/router';
-import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import { provideRouter } from '@angular/router';
+import { provideHttpClient, withInterceptors, withXsrfConfiguration } from '@angular/common/http';
 import { routes } from './app.routes';
 import { authInterceptor } from './auth.interceptor';
-import { HttpClient } from '@angular/common/http';
-import { catchError, of, tap } from 'rxjs';
+import { AuthService } from './auth.service';
 
-// セッション初期化ファクトリ
-function initializeAppFactory(http: HttpClient, router: Router) {
-  return () => {
-    // Step 11: Session情報取得API呼び出し
-    return http.get<any>('/api/ifs/session').pipe(
-      tap(sessionInfo => {
-        // Step 13: RedirectURLをもとに遷移
-        if (sessionInfo && sessionInfo.redirectUrl) {
-           // ルート(/)にいる場合のみリダイレクト（無限ループ防止）
-           if (window.location.pathname === '/') {
-             router.navigateByUrl(sessionInfo.redirectUrl);
-           }
-        }
-      }),
-      catchError((err) => {
-        // 未認証(401)の場合は何もしない（画面コンポーネント側でガードするか、ログインへ飛ばす）
-        // ここではアプリを通常起動させる
-        return of(null);
-      })
-    );
-  };
+function initializeAppFactory(authService: AuthService) {
+  // Angular起動前にセッションチェックを行う
+  return () => authService.checkSession();
 }
 
 export const appConfig: ApplicationConfig = {
   providers: [
     provideRouter(routes),
-    provideHttpClient(withInterceptors([authInterceptor])),
+    provideHttpClient(
+      withInterceptors([authInterceptor]),
+      // CSRFトークン設定 (重要)
+      withXsrfConfiguration({
+        cookieName: 'XSRF-TOKEN',
+        headerName: 'X-XSRF-TOKEN',
+      })
+    ),
     {
       provide: APP_INITIALIZER,
       useFactory: initializeAppFactory,
-      deps: [HttpClient, Router],
+      deps: [AuthService],
       multi: true
     }
   ]
@@ -259,26 +521,29 @@ export const appConfig: ApplicationConfig = {
 
 ---
 
-### 補足：Step 2, 10.2 の「元のURL」の受け渡しについて
+## 6. 解説と重要なポイント
 
-ご要望のフローでは `Step 10.2` で Referer から取得とありますが、OAuth2のコールバック時のRefererは `cognito.amazon.com` になっているため、元の `/hogehoge` は取得できません。
+JDBC Session (PostgreSQL) を利用する場合の特有の注意点とアドバイスです。
 
-これを実現するためには、以下のいずれかの方法を追加する必要があります。
-
-**推奨パターン（Springの機能を利用）:**
-Angularのインターセプターで401を検知した際、いきなり `/oauth2/authorization/cognito` へ飛ばすのではなく、**一度Springの「リダイレクト前処理エンドポイント」を叩く**ようにします。
-
-1. **Angular**: APIエラー(401) -> `window.location.href = '/api/auth/login?target=/hogehoge'`
-2. **Spring**: `/api/auth/login` コントローラー
-* クエリパラメータ `target` を取得。
-* `session.setAttribute("TARGET_URL", target)` を実行。
-* `response.sendRedirect("/oauth2/authorization/cognito")` を返す。
+1. **シリアライズの注意 (最重要)**
+* `session.setAttribute("key", value)` で保存する `value` オブジェクトは、必ず **`java.io.Serializable` を実装**している必要があります。
+* `Map<String, Object>` は中身がすべてSerializableならOKですが、自作クラスを保存する場合は `implements Serializable` を忘れると実行時エラーになります。
+* PostgreSQLの `ATTRIBUTE_BYTES` カラムにはJavaのオブジェクトがバイト列として保存されます。
 
 
-3. **Spring**: (Step 10) `CustomSuccessHandler`
-* `session.getAttribute("TARGET_URL")` で `/hogehoge` を取り出す。
-* `frontendSessionInfo` に詰める。
+2. **パフォーマンスとインデックス**
+* Spring Session JDBCは、リクエストのたびにDBアクセス（SELECT/UPDATE）が発生します。
+* `SPRING_SESSION` テーブルの `SESSION_ID` や `EXPIRY_TIME` にインデックスが貼られていること（DDL参照）を確認してください。これが無いとアクセス数増加時にDB負荷が急増します。
+
+
+3. **期限切れセッションの削除**
+* Redisと異なり、JDBCの場合は有効期限が切れたレコードが自動的には消えません。
+* Spring Bootは自動でクリーンアップジョブを動かしますが（`spring.session.jdbc.cleanup-cron` で設定可）、アクセスが多い場合はアプリ側でやらせず、DB側のバッチ処理やイベントで削除する運用も検討してください。
+
+
+4. **トランザクション管理**
+* Spring Session JDBCは内部でトランザクションを使用します。アプリ側で `@Transactional` を多用している場合、トランザクションの競合や長さに注意してください（通常はフレームワークがうまく処理しますが、念頭に置いておくと良いです）。
 
 
 
-これで、Step 13での正しい画面遷移が可能になります。
+この構成であれば、フロントエンドはモダンでステートレスな実装を保ちつつ、バックエンドは堅牢なRDBでセッション管理を行うことができます。
