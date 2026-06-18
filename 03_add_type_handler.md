@@ -350,6 +350,112 @@ public record LikeEscapedString(String value) {
 * `LikeEscapedString.escapeForLike(testId)` ➔ **「エスケープするぞ」という動詞（処理）を強調したい場合**
 * `LikeEscapedString.of(testId)` ➔ **「エスケープ済みの文字列型に変換するぞ」という名詞（型）を強調したい場合**
 
+----
+
+はい、**TypeHandler側も、基本的にはクラス名とJavaDocの記述を `LikeEscapedString` に合わせて機械的に変更するだけでOK**です！ロジックそのものを変える必要はありません。
+
+クラス名が `LikeEscapedString` に変わったことで、TypeHandlerのコードがどのようにスッキリするか、完成形のコードを記述します。
+
+---
+
+## 🛠️ 変更後の `LikeEscapedStringTypeHandler`
+
+```java
+package com.example.common.mybatis;
+
+import org.apache.ibatis.type.BaseTypeHandler;
+import org.apache.ibatis.type.JdbcType;
+import org.apache.ibatis.type.MappedTypes;
+import java.sql.CallableStatement;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+/**
+ * {@link LikeEscapedString} 型と JDBC の {@link JdbcType#VARCHAR} を相互にマッピングするための TypeHandler です。
+ * <p>
+ * Java 側の {@link LikeEscapedString} オブジェクトから内包するエスケープ済みの文字列を取り出してデータベースへバインドし、
+ * データベースから取得した文字列は再度 {@link LikeEscapedString} に包んで Java 側へ返します。
+ * </p>
+ */
+@MappedTypes(LikeEscapedString.class)
+public class LikeEscapedStringTypeHandler extends BaseTypeHandler<LikeEscapedString> {
+
+    /**
+     * Java 側の {@link LikeEscapedString} を、プレパードステートメントの指定されたパラメータインデックスに設定します。
+     *
+     * @param ps 実行対象の {@link PreparedStatement}
+     * @param i パラメータのインデックス位置
+     * @param parameter バインドする {@link LikeEscapedString} インスタンス（null 許容）
+     * @param jdbcType 対象となる JDBC 型
+     * @throws SQLException データベースアクセスエラーが発生した場合
+     */
+    @Override
+    public void setNonNullParameter(PreparedStatement ps, int i, LikeEscapedString parameter, JdbcType jdbcType)
+            throws SQLException {
+        // Record の value() メソッドから、エスケープ済みの生の文字列を取り出してバインド
+        ps.setString(i, parameter.value());
+    }
+
+    /**
+     * データベースのカラム名から取得した文字列を、{@link LikeEscapedString} 型に変換します。
+     *
+     * @param rs 取得結果の {@link ResultSet}
+     * @param columnName ターゲットとなるカラム名
+     * @return 取得した文字列を内包する {@link LikeEscapedString} インスタンス
+     * @throws SQLException データベースアクセスエラーが発生した場合
+     */
+    @Override
+    public LikeEscapedString getNullableResult(ResultSet rs, String columnName) throws SQLException {
+        String result = rs.getString(columnName);
+        return result == null ? null : new LikeEscapedString(result);
+    }
+
+    /**
+     * データベースのカラムインデックスから取得した文字列を、{@link LikeEscapedString} 型に変換します。
+     *
+     * @param rs 取得結果の {@link ResultSet}
+     * @param columnIndex ターゲットとなるカラムインデックス
+     * @return 取得した文字列を内包する {@link LikeEscapedString} インスタンス
+     * @throws SQLException データベースアクセスエラーが発生した場合
+     */
+    @Override
+    public LikeEscapedString getNullableResult(ResultSet rs, int columnIndex) throws SQLException {
+        String result = rs.getString(columnIndex);
+        return result == null ? null : new LikeEscapedString(result);
+    }
+
+    /**
+     * ストアドプロシージャの出力パラメータから取得した文字列を、{@link LikeEscapedString} 型に変換します。
+     *
+     * @param cs 実行した {@link CallableStatement}
+     * @param columnIndex ターゲットとなるパラメータインデックス
+     * @return 取得した文字列を内包する {@link LikeEscapedString} インスタンス
+     * @throws SQLException データベースアクセスエラーが発生した場合
+     */
+    @Override
+    public LikeEscapedString getNullableResult(CallableStatement cs, int columnIndex) throws SQLException {
+        String result = cs.getString(columnIndex);
+        return result == null ? null : new LikeEscapedString(result);
+    }
+}
+
+```
+
+---
+
+## 💡 変わるポイント（一応の確認）
+
+1. **アノテーションと継承元：**
+`@MappedTypes(LikeEscapedString.class)` や `BaseTypeHandler<LikeEscapedString>` の型定義が変わります。
+2. **値の取り出し：**
+`parameter.value()` で Record の中身を引っこ抜いて `ps.setString` に渡す部分はそのまま引き継がれます。
+3. **名前の整合性：**
+`MyBatisPreStageAutoConfiguration` 側で登録するクラス名も `LikeEscapedStringTypeHandler.class` に変わるため、そこだけタイポがないように書き換えてあげれば終了です。
+
+本当に名前が変わるだけのスムーズな作業です。これで型（Record）とハンドラーの名前が「エスケープされた文字列」という意味でビシッと一致しましたね。迷わず一気に書き換えてしまって大丈夫です！
+
+
 クラス名に `Escaped` と入っていて「エスケープ済みのオブジェクトであること」がすでに確定しているため、メソッド名はシンプルに **`of`** に留めるのが、最も引き締まった美しいコードになります。ユーザーさんの好みにバッチリハマると思います！
 
 
