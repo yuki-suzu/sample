@@ -275,3 +275,81 @@ LikeContainsPattern pattern = new LikeContainsPattern(criteria.getUserName());
 List<User> users = userMapper.selectByName(pattern);
 
 ```
+
+
+----
+
+`of` を使うパターンも、Javaの標準ライブラリ（`List.of()` や `Optional.of()` など）で広く採用されているデザインパターン（静的ファクトリメソッド）なので、非常にスマートで直感的です！
+
+もしクラス名を **`LikeEscapedString`** にするのであれば、`of` を使った場合のJavaソースの見え方は以下のようになります。
+
+```java
+// クラス名が「状態」を、メソッド名「of」がインスタンス生成を表す
+LikeEscapedString escapedTestId = LikeEscapedString.of(testId);
+
+```
+
+---
+
+## 💡 `of` を選ぶメリット
+
+1. **コードが短く、流れるように読める**
+`LikeEscapedString.escapeForLike(testId)` と書くよりも、`LikeEscapedString.of(testId)` の方が圧倒的にシンプルでタイピングも楽です。
+2. **「型変換」の意図が明確になる**
+モダンなJavaにおいて `型名.of(値)` は、「この値を元にして、この型のオブジェクト（値オブジェクト）を作ってね」という共通言語になっているため、ソースを読む人が一瞬で「あ、`String` から `LikeEscapedString` に型を変換しているんだな」と理解できます。
+
+---
+
+## 🛠️ `of` を採用した場合の最終形コード
+
+もし `of` を採用される場合、Recordクラスの構造は以下のようになります。
+
+```java
+package com.example.common.mybatis;
+
+/**
+ * SQLのLIKE検索において、中間一致（Contains）等に使用するために
+ * 特殊文字（{@code %}, {@code _}, {@code \}）を安全にエスケープした文字列を保持する値オブジェクトです。
+ * <p>
+ * 本クラスは純粋なエスケープ処理済みの文字列のみを保持し、ワイルドカード（{@code %Delta}）の付与は行いません。
+ * ワイルドカードの結合は、MyBatisのXML側（{@code CONCAT}句など）で行う必要があります。
+ * </p>
+ *
+ * @param value エスケープ処理が施された生の文字列
+ */
+public record LikeEscapedString(String value) {
+
+    /**
+     * 指定された検索クエリ文字列から、LIKE検索用に特殊文字をエスケープした {@link LikeEscapedString} を生成します。
+     *
+     * @param query 画面などから入力された生の検索クエリ（null許容）
+     * @return エスケープ済みの文字列を保持する {@link LikeEscapedString} インスタンス。
+     * 入力が null または空文字の場合は、中身が null または空文字のインスタンスを返します。
+     */
+    public static LikeEscapedString of(String query) {
+        if (query == null) {
+            return new LikeEscapedString(null);
+        }
+        
+        // 特殊文字の退避処理（バックスラッシュを最優先で置換）
+        String escaped = query
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_");
+        
+        return new LikeEscapedString(escaped);
+    }
+}
+
+```
+
+---
+
+## 🏁 最終ジャッジ
+
+* `LikeEscapedString.escapeForLike(testId)` ➔ **「エスケープするぞ」という動詞（処理）を強調したい場合**
+* `LikeEscapedString.of(testId)` ➔ **「エスケープ済みの文字列型に変換するぞ」という名詞（型）を強調したい場合**
+
+クラス名に `Escaped` と入っていて「エスケープ済みのオブジェクトであること」がすでに確定しているため、メソッド名はシンプルに **`of`** に留めるのが、最も引き締まった美しいコードになります。ユーザーさんの好みにバッチリハマると思います！
+
+
