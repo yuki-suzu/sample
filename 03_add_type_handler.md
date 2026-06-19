@@ -310,34 +310,40 @@ package com.example.common.mybatis;
 /**
  * SQLのLIKE検索において、中間一致（Contains）等に使用するために
  * 特殊文字（{@code %}, {@code _}, {@code \}）を安全にエスケープした文字列を保持する値オブジェクトです。
- * <p>
- * 本クラスは純粋なエスケープ処理済みの文字列のみを保持し、ワイルドカード（{@code %Delta}）の付与は行いません。
- * ワイルドカードの結合は、MyBatisのXML側（{@code CONCAT}句など）で行う必要があります。
- * </p>
  *
  * @param value エスケープ処理が施された生の文字列
  */
 public record LikeEscapedString(String value) {
 
     /**
+     * コンパクトコンストラクタ。
+     * <p>
+     * 開発者が {@code new LikeEscapedString(query)} を直接呼び出した場合でも、
+     * このコンストラクタが必ず先回りで実行され、内部の文字列を強制的にエスケープします。
+     * </p>
+     */
+    public LikeEscapedString {
+        // 引数で受け取った「value」を直接書き換えると、それがそのままRecordのフィールドにセットされます
+        if (value != null) {
+            value = value
+                    .replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_");
+        }
+    }
+
+    /**
      * 指定された検索クエリ文字列から、LIKE検索用に特殊文字をエスケープした {@link LikeEscapedString} を生成します。
+     * <p>
+     * 内部で {@code new} を呼び出しているため、コンパクトコンストラクタを介して安全にエスケープされます。
+     * </p>
      *
      * @param query 画面などから入力された生の検索クエリ（null許容）
-     * @return エスケープ済みの文字列を保持する {@link LikeEscapedString} インスタンス。
-     * 入力が null または空文字の場合は、中身が null または空文字のインスタンスを返します。
+     * @return エスケープ済みの文字列を保持する {@link LikeEscapedString} インスタンス
      */
     public static LikeEscapedString of(String query) {
-        if (query == null) {
-            return new LikeEscapedString(null);
-        }
-        
-        // 特殊文字の退避処理（バックスラッシュを最優先で置換）
-        String escaped = query
-                .replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_");
-        
-        return new LikeEscapedString(escaped);
+        // ここは new するだけでOK！上のコンパクトコンストラクタが勝手にエスケープしてくれます
+        return new LikeEscapedString(query);
     }
 }
 
