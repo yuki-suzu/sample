@@ -13,7 +13,7 @@ cd /c/JMeter/projects/scenarios
 
 # Linux用のスクリプトをWindows上で事前生成
 for f in *.jmx; do
-  echo "jmeter -n -t \"./$f\" -l \"./${f%.jmx}.jtl\" -Jthreads=10 -Jrampup=5 -Jloops=1 && jmeter -g \"./${f%.jmx}.jtl\" -o \"./${f%.jmx}_report\""
+  echo "jmeter -n -t \"./$f\" -l \"./${f%.jmx}.jtl\" -Jthreads=2 -Jrampup=4 -Jloops=3 && jmeter -g \"./${f%.jmx}.jtl\" -o \"./${f%.jmx}_report\""
 done > run_jmeter.sh
 ```
 
