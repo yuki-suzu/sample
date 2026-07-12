@@ -8,8 +8,13 @@
 ### シェル作成
 dos
 ```sh
-:: ※Linux側の配置先を /opt/jmeter/scenarios と仮定した場合
-(for %f in ("C:\JMeter\scenarios\*.jmx") do @echo jmeter -n -t "/opt/jmeter/scenarios/%~nxf" -l "/opt/jmeter/scenarios/%~nf.jtl" -Jthreads=10 -Jrampup=5 -Jloops=1 && jmeter -g "/opt/jmeter/scenarios/%~nf.jtl" -o "/opt/jmeter/scenarios/%~nf_report") > run_jmeter.sh
+# Windowsのフォルダへ移動（Git Bashでのパス表現の例）
+cd /c/JMeter/projects/scenarios
+
+# Linux用のスクリプトをWindows上で事前生成
+for f in *.jmx; do
+  echo "jmeter -n -t \"./$f\" -l \"./${f%.jmx}.jtl\" -Jthreads=10 -Jrampup=5 -Jloops=1 && jmeter -g \"./${f%.jmx}.jtl\" -o \"./${f%.jmx}_report\""
+done > run_jmeter.sh
 ```
 
 #### 実行
