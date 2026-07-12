@@ -14,7 +14,7 @@ echo '# --- 1. 負荷テストを一斉に並列実行 ---' >> run_jmeter.sh
 
 # 2. テスト実行部分を「&」で並列化して書き出し
 for f in *.jmx; do
-  echo "jmeter -n -t \"./$f\" -l \"./${f%.jmx}.jtl\" -Jthreads=10 -Jrampup=5 -Jloops=1 &" >> run_jmeter.sh
+  echo "jmeter -n -t \"./$f\" -l \"./${f%.jmx}.jtl\" -Jthreads=2 -JrampUp=4 -Jloop=3 &" >> run_jmeter.sh
 done
 
 # 3. すべての並列テストが終わるまで待つコマンドを差し込む
