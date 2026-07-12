@@ -6,23 +6,23 @@
 
 
 ### シェル作成
-dos
+bash
 ```sh
-# スクリプトファイルを初期化
-echo "#!/bin/bash" > run_jmeter.sh
-echo "# --- 1. 負荷テストを一斉に並列実行 ---" >> run_jmeter.sh
+# 1. スクリプトファイルを初期化（シングルクォーテーションで ! の暴走を防ぐ）
+echo '#!/bin/bash' > run_jmeter.sh
+echo '# --- 1. 負荷テストを一斉に並列実行 ---' >> run_jmeter.sh
 
-# テスト実行部分を「&」で並列化して書き出し
+# 2. テスト実行部分を「&」で並列化して書き出し
 for f in *.jmx; do
   echo "jmeter -n -t \"./$f\" -l \"./${f%.jmx}.jtl\" -Jthreads=10 -Jrampup=5 -Jloops=1 &" >> run_jmeter.sh
 done
 
-# すべての並列テストが終わるまで待つコマンドを差し込む
-echo "wait" >> run_jmeter.sh
-echo "" >> run_jmeter.sh
-echo "# --- 2. テスト完了後にレポートをまとめて生成 ---" >> run_jmeter.sh
+# 3. すべての並列テストが終わるまで待つコマンドを差し込む
+echo 'wait' >> run_jmeter.sh
+echo '' >> run_jmeter.sh
+echo '# --- 2. テスト完了後にレポートをまとめて生成 ---' >> run_jmeter.sh
 
-# レポート生成部分を書き出し
+# 4. レポート生成部分を書き出し
 for f in *.jmx; do
   echo "jmeter -g \"./${f%.jmx}.jtl\" -o \"./${f%.jmx}_report\"" >> run_jmeter.sh
 done
