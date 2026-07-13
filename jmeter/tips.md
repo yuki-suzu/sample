@@ -28,6 +28,19 @@ for f in *.jmx; do
 done
 ```
 
+① スレッドグループ（Thread Group）の設定
+Loop Count (ループ回数): Infinite（無限）にチェック（または -1）
+
+Duration (持続時間): ${__P(duration, 600)}
+
+② Precise Throughput Timer の設定
+Target throughput: ${__P(throughput, 100)}
+
+Throughput period (seconds): ${__P(period, 1)}
+
+Test duration (seconds): ${__P(duration, 600)}
+
+
 #### 実行
 ```sh
 # 1. スクリプトに実行権限を与える
