@@ -1,50 +1,74 @@
 ```groovy
 import groovy.json.JsonSlurper
+import java.net.URLEncoder
 
-def PROP_TOKEN = "GLOBAL_ACCESS_TOKEN"
+// ============================================================================
+// 1. 定数・初期値（デフォルト値）の定義
+// ============================================================================
+def DEFAULT_TOKEN_URL     = "https://auth.example.com/oauth/token"
+def DEFAULT_CLIENT_ID     = "default_client_id"
+def DEFAULT_CLIENT_SECRET = "default_client_secret"
+
+def PROP_TOKEN      = "GLOBAL_ACCESS_TOKEN"
 def PROP_EXPIRES_AT = "GLOBAL_TOKEN_EXPIRES_AT"
 
+// ============================================================================
+// 2. 高速チェック（ノンブロッキング）
+// ============================================================================
 long now = System.currentTimeMillis() / 1000
 String currentToken = props.get(PROP_TOKEN)
 String expiresAtStr = props.get(PROP_EXPIRES_AT)
 long expiresAt = expiresAtStr ? expiresAtStr.toLong() : 0L
 
-// 1. 高速チェック（トークンがまだ有効なら即スキップ）
+// キャッシュが存在し、かつ有効期限内であれば即座に処理終了（他の重い処理は一切叩かない）
 if (currentToken != null && now < expiresAt) {
     return
 }
 
-// 2. 排他制御（複数スレッドが一斉にトークン取得するのを防ぐ）
+// ============================================================================
+// 3. 排他制御（トークン期限切れ時のみ、全スレッドで1スレッドずつ処理）
+// ============================================================================
 synchronized(this.class) {
-    // ダブルチェック（他スレッドが更新完了していないか確認）
+    
+    // 【矛盾防止ポイント①】ロック獲得後の二重チェック（Double-Checking Lock）
+    // ロック待ちをしている間に、先行スレッドがすでにトークンを更新してくれたか最新状態を再取得する
     now = System.currentTimeMillis() / 1000
     currentToken = props.get(PROP_TOKEN)
     expiresAtStr = props.get(PROP_EXPIRES_AT)
     expiresAt = expiresAtStr ? expiresAtStr.toLong() : 0L
 
     if (currentToken != null && now < expiresAt) {
+        log.info("[OAuth2] 他スレッドによるトークン更新を確認したため、処理をスキップします。")
         return
     }
 
-    log.info("[ヒートラン] トークン更新処理を開始します...")
+    log.info("[OAuth2] トークンが未取得または期限切れのため、再取得処理を開始します...")
 
-    def tokenUrl = "https://auth.example.com/oauth/token"
-    def postBody = "grant_type=client_credentials&client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET"
+    // 【矛盾防止ポイント②】トークン取得が必要になって初めてパラメータを評価＆組み立てる
+    def tokenUrl     = props.get("OAUTH_TOKEN_URL")     ?: vars.get("OAUTH_TOKEN_URL")     ?: DEFAULT_TOKEN_URL
+    def clientId     = props.get("OAUTH_CLIENT_ID")     ?: vars.get("OAUTH_CLIENT_ID")     ?: DEFAULT_CLIENT_ID
+    def clientSecret = props.get("OAUTH_CLIENT_SECRET") ?: vars.get("OAUTH_CLIENT_SECRET") ?: DEFAULT_CLIENT_SECRET
 
+    def postBody = "grant_type=client_credentials" +
+                   "&client_id=" + URLEncoder.encode(clientId, "UTF-8") +
+                   "&client_secret=" + URLEncoder.encode(clientSecret, "UTF-8")
+
+    // ============================================================================
+    // 4. リトライ機能付きトークン取得API呼び出し
+    // ============================================================================
     int maxRetries = 3          // 最大リトライ回数
-    long retryIntervalMs = 2000 // リトライ間隔（2秒）
+    long retryIntervalMs = 2000 // リトライ間隔（ミリ秒）
     boolean isSuccess = false
 
-    // ---- 【対策1】リトライループ ----
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            log.info("[ヒートラン] トークン取得試行 (" + attempt + "/" + maxRetries + ")...")
+            log.info("[OAuth2] トークン取得試行 (" + attempt + "/" + maxRetries + ") -> " + tokenUrl)
 
             def connection = new URL(tokenUrl).openConnection() as HttpURLConnection
             connection.setRequestMethod("POST")
             connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-            connection.setConnectTimeout(5000) // タイムアウト5秒
-            connection.setReadTimeout(5000)
+            connection.setConnectTimeout(5000) // 接続タイムアウト 5秒
+            connection.setReadTimeout(5000)    // 応答タイムアウト 5秒
             connection.doOutput = true
 
             connection.outputStream.withWriter("UTF-8") { writer -> writer.write(postBody) }
@@ -54,44 +78,46 @@ synchronized(this.class) {
                 String accessToken = json.access_token
                 long expiresIn = json.expires_in as long
 
-                // 5分(300秒)前に切れるよう期限を計算
+                // 有効期限の5分(300秒)前に切れるよう計算（安全マージン）
                 long newExpiresAt = now + expiresIn - 300
 
-                // 成功した時のみ、プロパティ（メモリ）を上書き更新
+                // 成功時のみグローバルプロパティに保存
                 props.put(PROP_TOKEN, accessToken)
                 props.put(PROP_EXPIRES_AT, newExpiresAt.toString())
 
-                log.info("[ヒートラン] トークンの取得・更新に成功しました！")
+                log.info("[OAuth2] 新しいアクセストークンの取得・保存に成功しました！")
                 isSuccess = true
-                break // 成功したのでループ脱出
+                break // リトライループ脱出
             } else {
-                log.warn("[ヒートラン] トークン取得失敗: HTTP " + connection.responseCode)
+                log.warn("[OAuth2] トークン取得失敗: HTTP status " + connection.responseCode)
             }
         } catch (Exception e) {
-            log.warn("[ヒートラン] トークン取得時の通信例外: " + e.message)
+            log.warn("[OAuth2] トークン取得時の通信例外: " + e.message)
         }
 
-        // 失敗時、規定回数に達していなければ待機して再試行
+        // 失敗時、規定回数未満なら待機して再試行
         if (!isSuccess && attempt < maxRetries) {
-            log.info("[ヒートラン] " + (retryIntervalMs / 1000) + "秒後に再試行します...")
+            log.info("[OAuth2] " + (retryIntervalMs / 1000) + "秒後に再試行します...")
             sleep(retryIntervalMs)
         }
     }
 
-    // ---- 【対策2】全試行失敗時のフォールバック処理 ----
+    // ============================================================================
+    // 5. リトライ全滅時のフォールバック処理
+    // ============================================================================
     if (!isSuccess) {
-        log.error("[ヒートラン] " + maxRetries + "回のリトライすべてでトークン取得に失敗しました。")
+        log.error("[OAuth2] " + maxRetries + "回のリトライすべてでトークン取得に失敗しました。")
 
         if (currentToken != null) {
-            // 古いトークンが存在する場合、消さずに残す！
-            // ただし、毎リクエストで即座にAPI取得へ突入するのを防ぐため、有効期限を「10秒後」に一時延命して次回ループで再挑戦させる
+            // 【矛盾防止ポイント③】すでに古いトークンがある場合は破棄せず10秒延命
+            // 毎リクエストで重いリトライ処理が叩かれるのを防ぎつつ、10秒後に再チャレンジさせる
             long gracePeriod = now + 10
             props.put(PROP_EXPIRES_AT, gracePeriod.toString())
-            log.warn("[ヒートラン] 既存のトークンを維持し、10秒後に再度トークン取得を試みます。")
+            log.warn("[OAuth2] 既存トークンを維持し、10秒後に再度取得を試みます。")
         } else {
-            // 初回起動時でトークンが一度も取れていない場合はテストをエラーにする
+            // 初回起動時（既存トークンなし）で失敗した場合はテスト自体を失敗扱いにする
             AssertionResult.setFailure(true)
-            AssertionResult.setFailureMessage("初回のOAuth2トークン取得に失敗しました。")
+            AssertionResult.setFailureMessage("初回のOAuth2トークン取得に失敗しました。認証サーバーまたは設定を確認してください。")
         }
     }
 }
