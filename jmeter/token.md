@@ -1,8 +1,6 @@
 ```groovy
 import groovy.json.JsonSlurper
-import groovy.json.JsonOutput
 
-// トークン保管用のプロパティキー
 def PROP_TOKEN = "GLOBAL_ACCESS_TOKEN"
 def PROP_EXPIRES_AT = "GLOBAL_TOKEN_EXPIRES_AT"
 
@@ -11,46 +9,91 @@ String currentToken = props.get(PROP_TOKEN)
 String expiresAtStr = props.get(PROP_EXPIRES_AT)
 long expiresAt = expiresAtStr ? expiresAtStr.toLong() : 0L
 
-// トークンがまだ有効なら何もしない（メモリ上のプロパティを再利用）
+// 1. 高速チェック（トークンがまだ有効なら即スキップ）
 if (currentToken != null && now < expiresAt) {
-    log.info("既存のキャッシュトークンを使用します。")
     return
 }
 
-// ---- トークンが未取得または期限切れの場合、OAuth2 APIを呼び出す ----
-log.info("アクセストークンを取得/更新します...")
+// 2. 排他制御（複数スレッドが一斉にトークン取得するのを防ぐ）
+synchronized(this.class) {
+    // ダブルチェック（他スレッドが更新完了していないか確認）
+    now = System.currentTimeMillis() / 1000
+    currentToken = props.get(PROP_TOKEN)
+    expiresAtStr = props.get(PROP_EXPIRES_AT)
+    expiresAt = expiresAtStr ? expiresAtStr.toLong() : 0L
 
-def tokenUrl = "https://auth.example.com/oauth/token"
-def postBody = "grant_type=client_credentials&client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET"
+    if (currentToken != null && now < expiresAt) {
+        return
+    }
 
-def connection = new URL(tokenUrl).openConnection() as HttpURLConnection
-connection.setRequestMethod("POST")
-connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-connection.doOutput = true
+    log.info("[ヒートラン] トークン更新処理を開始します...")
 
-connection.outputStream.withWriter("UTF-8") { writer ->
-    writer.write(postBody)
-}
+    def tokenUrl = "https://auth.example.com/oauth/token"
+    def postBody = "grant_type=client_credentials&client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET"
 
-if (connection.responseCode == 200) {
-    def responseText = connection.inputStream.text
-    def json = new JsonSlurper().parseText(responseText)
-    
-    String accessToken = json.access_token
-    long expiresIn = json.expires_in as long // 秒単位
-    
-    // 5分余裕をもって有効期限を設定
-    long newExpiresAt = now + expiresIn - 300
-    
-    // 全スレッドグループで共有できる JMeter props に保存
-    props.put(PROP_TOKEN, accessToken)
-    props.put(PROP_EXPIRES_AT, newExpiresAt.toString())
-    
-    log.info("新しいトークンを取得し、プロパティに保存しました。")
-} else {
-    log.error("トークン取得失敗: HTTP " + connection.responseCode)
-    AssertionResult.setFailure(true)
-    AssertionResult.setFailureMessage("OAuth2トークンの取得に失敗しました。")
+    int maxRetries = 3          // 最大リトライ回数
+    long retryIntervalMs = 2000 // リトライ間隔（2秒）
+    boolean isSuccess = false
+
+    // ---- 【対策1】リトライループ ----
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            log.info("[ヒートラン] トークン取得試行 (" + attempt + "/" + maxRetries + ")...")
+
+            def connection = new URL(tokenUrl).openConnection() as HttpURLConnection
+            connection.setRequestMethod("POST")
+            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+            connection.setConnectTimeout(5000) // タイムアウト5秒
+            connection.setReadTimeout(5000)
+            connection.doOutput = true
+
+            connection.outputStream.withWriter("UTF-8") { writer -> writer.write(postBody) }
+
+            if (connection.responseCode == 200) {
+                def json = new JsonSlurper().parseText(connection.inputStream.text)
+                String accessToken = json.access_token
+                long expiresIn = json.expires_in as long
+
+                // 5分(300秒)前に切れるよう期限を計算
+                long newExpiresAt = now + expiresIn - 300
+
+                // 成功した時のみ、プロパティ（メモリ）を上書き更新
+                props.put(PROP_TOKEN, accessToken)
+                props.put(PROP_EXPIRES_AT, newExpiresAt.toString())
+
+                log.info("[ヒートラン] トークンの取得・更新に成功しました！")
+                isSuccess = true
+                break // 成功したのでループ脱出
+            } else {
+                log.warn("[ヒートラン] トークン取得失敗: HTTP " + connection.responseCode)
+            }
+        } catch (Exception e) {
+            log.warn("[ヒートラン] トークン取得時の通信例外: " + e.message)
+        }
+
+        // 失敗時、規定回数に達していなければ待機して再試行
+        if (!isSuccess && attempt < maxRetries) {
+            log.info("[ヒートラン] " + (retryIntervalMs / 1000) + "秒後に再試行します...")
+            sleep(retryIntervalMs)
+        }
+    }
+
+    // ---- 【対策2】全試行失敗時のフォールバック処理 ----
+    if (!isSuccess) {
+        log.error("[ヒートラン] " + maxRetries + "回のリトライすべてでトークン取得に失敗しました。")
+
+        if (currentToken != null) {
+            // 古いトークンが存在する場合、消さずに残す！
+            // ただし、毎リクエストで即座にAPI取得へ突入するのを防ぐため、有効期限を「10秒後」に一時延命して次回ループで再挑戦させる
+            long gracePeriod = now + 10
+            props.put(PROP_EXPIRES_AT, gracePeriod.toString())
+            log.warn("[ヒートラン] 既存のトークンを維持し、10秒後に再度トークン取得を試みます。")
+        } else {
+            // 初回起動時でトークンが一度も取れていない場合はテストをエラーにする
+            AssertionResult.setFailure(true)
+            AssertionResult.setFailureMessage("初回のOAuth2トークン取得に失敗しました。")
+        }
+    }
 }
 ```
 その通りじゃ！後者の Groovy 方式なら、**Windows/LinuxなどのOSの違いも、GUI（画面起動）/CUI（CLI非対面実行）の違いも一切関係なく完全クロスプラットフォームで動作する**ぞ！
