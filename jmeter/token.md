@@ -1,6 +1,9 @@
 ```groovy
 import groovy.json.JsonSlurper
 import java.net.URLEncoder
+import java.net.Proxy
+import java.net.InetSocketAddress
+import java.util.Base64
 
 // ============================================================================
 // 1. 定数・初期値（デフォルト値）の定義
@@ -20,7 +23,6 @@ String currentToken = props.get(PROP_TOKEN)
 String expiresAtStr = props.get(PROP_EXPIRES_AT)
 long expiresAt = expiresAtStr ? expiresAtStr.toLong() : 0L
 
-// キャッシュが存在し、かつ有効期限内であれば即座に処理終了（他の重い処理は一切叩かない）
 if (currentToken != null && now < expiresAt) {
     return
 }
@@ -30,8 +32,7 @@ if (currentToken != null && now < expiresAt) {
 // ============================================================================
 synchronized(this.class) {
     
-    // 【矛盾防止ポイント①】ロック獲得後の二重チェック（Double-Checking Lock）
-    // ロック待ちをしている間に、先行スレッドがすでにトークンを更新してくれたか最新状態を再取得する
+    // ロック獲得後の二重チェック（Double-Checking Lock）
     now = System.currentTimeMillis() / 1000
     currentToken = props.get(PROP_TOKEN)
     expiresAtStr = props.get(PROP_EXPIRES_AT)
@@ -44,17 +45,26 @@ synchronized(this.class) {
 
     log.info("[OAuth2] トークンが未取得または期限切れのため、再取得処理を開始します...")
 
-    // 【矛盾防止ポイント②】トークン取得が必要になって初めてパラメータを評価＆組み立てる
-    def tokenUrl     = props.get("OAUTH_TOKEN_URL")     ?: vars.get("OAUTH_TOKEN_URL")     ?: DEFAULT_TOKEN_URL
+    // ---- パラメータ取得 ----
     def clientId     = props.get("OAUTH_CLIENT_ID")     ?: vars.get("OAUTH_CLIENT_ID")     ?: DEFAULT_CLIENT_ID
     def clientSecret = props.get("OAUTH_CLIENT_SECRET") ?: vars.get("OAUTH_CLIENT_SECRET") ?: DEFAULT_CLIENT_SECRET
+
+    // FQDN または フルURL の自動判定
+    def rawFqdnOrUrl = props.get("OAUTH_TOKEN_URL") ?: vars.get("FQDN") ?: vars.get("OAUTH_TOKEN_URL") ?: DEFAULT_TOKEN_URL
+    def tokenUrl     = rawFqdnOrUrl.startsWith("http") ? rawFqdnOrUrl : "https://" + rawFqdnOrUrl + "/oauth/token"
+
+    // ---- プロキシ設定の取得（プロパティまたは変数から取得） ----
+    def proxyHost = props.get("PROXY_HOST") ?: vars.get("PROXY_HOST")
+    def proxyPort = props.get("PROXY_PORT") ?: vars.get("PROXY_PORT")
+    def proxyUser = props.get("PROXY_USER") ?: vars.get("PROXY_USER")
+    def proxyPass = props.get("PROXY_PASS") ?: vars.get("PROXY_PASS")
 
     def postBody = "grant_type=client_credentials" +
                    "&client_id=" + URLEncoder.encode(clientId, "UTF-8") +
                    "&client_secret=" + URLEncoder.encode(clientSecret, "UTF-8")
 
     // ============================================================================
-    // 4. リトライ機能付きトークン取得API呼び出し
+    // 4. リトライ機能付きトークン取得API呼び出し（プロキシ対応）
     // ============================================================================
     int maxRetries = 3          // 最大リトライ回数
     long retryIntervalMs = 2000 // リトライ間隔（ミリ秒）
@@ -64,7 +74,26 @@ synchronized(this.class) {
         try {
             log.info("[OAuth2] トークン取得試行 (" + attempt + "/" + maxRetries + ") -> " + tokenUrl)
 
-            def connection = new URL(tokenUrl).openConnection() as HttpURLConnection
+            URL url = new URL(tokenUrl)
+            HttpURLConnection connection
+
+            // プロキシの設定判定
+            if (proxyHost && proxyPort) {
+                log.info("[OAuth2] プロキシ経由で接続します: " + proxyHost + ":" + proxyPort)
+                Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyHost, proxyPort.toInteger()))
+                connection = (HttpURLConnection) url.openConnection(proxy)
+
+                // プロキシ認証（BASIC認証）が必要な場合
+                if (proxyUser && proxyPass) {
+                    String authStr = proxyUser + ":" + proxyPass
+                    String encodedAuth = Base64.getEncoder().encodeToString(authStr.getBytes("UTF-8"))
+                    connection.setRequestProperty("Proxy-Authorization", "Basic " + encodedAuth)
+                }
+            } else {
+                // プロキシ指定がない場合は直接接続
+                connection = (HttpURLConnection) url.openConnection()
+            }
+
             connection.setRequestMethod("POST")
             connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
             connection.setConnectTimeout(5000) // 接続タイムアウト 5秒
@@ -78,7 +107,7 @@ synchronized(this.class) {
                 String accessToken = json.access_token
                 long expiresIn = json.expires_in as long
 
-                // 有効期限の5分(300秒)前に切れるよう計算（安全マージン）
+                // 有効期限の5分(300秒)前に切れるよう計算
                 long newExpiresAt = now + expiresIn - 300
 
                 // 成功時のみグローバルプロパティに保存
@@ -95,7 +124,6 @@ synchronized(this.class) {
             log.warn("[OAuth2] トークン取得時の通信例外: " + e.message)
         }
 
-        // 失敗時、規定回数未満なら待機して再試行
         if (!isSuccess && attempt < maxRetries) {
             log.info("[OAuth2] " + (retryIntervalMs / 1000) + "秒後に再試行します...")
             sleep(retryIntervalMs)
@@ -109,18 +137,19 @@ synchronized(this.class) {
         log.error("[OAuth2] " + maxRetries + "回のリトライすべてでトークン取得に失敗しました。")
 
         if (currentToken != null) {
-            // 【矛盾防止ポイント③】すでに古いトークンがある場合は破棄せず10秒延命
-            // 毎リクエストで重いリトライ処理が叩かれるのを防ぎつつ、10秒後に再チャレンジさせる
+            // 古いトークンがある場合は10秒延命して次回再挑戦
             long gracePeriod = now + 10
             props.put(PROP_EXPIRES_AT, gracePeriod.toString())
             log.warn("[OAuth2] 既存トークンを維持し、10秒後に再度取得を試みます。")
         } else {
-            // 初回起動時（既存トークンなし）で失敗した場合はテスト自体を失敗扱いにする
-            AssertionResult.setFailure(true)
-            AssertionResult.setFailureMessage("初回のOAuth2トークン取得に失敗しました。認証サーバーまたは設定を確認してください。")
+            // 初回起動時（既存トークンなし）で失敗した場合は JSR223 Sampler 自体をエラー扱いにする
+            SampleResult.setSuccessful(false)
+            SampleResult.setResponseCode("500")
+            SampleResult.setResponseMessage("初回のOAuth2トークン取得に失敗しました。プロキシ設定や認証サーバーを確認してください。")
         }
     }
 }
+
 ```
 その通りじゃ！後者の Groovy 方式なら、**Windows/LinuxなどのOSの違いも、GUI（画面起動）/CUI（CLI非対面実行）の違いも一切関係なく完全クロスプラットフォームで動作する**ぞ！
 
