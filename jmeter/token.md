@@ -1,103 +1,123 @@
 ```groovy
 import groovy.json.JsonSlurper
-import java.net.URLEncoder
 import java.net.Proxy
 import java.net.InetSocketAddress
-import java.util.Base64
 
 // ============================================================================
-// 1. 定数・初期値（デフォルト値）の定義
+// 1. 定数・初期値の定義
 // ============================================================================
-def DEFAULT_TOKEN_URL     = "https://auth.example.com/oauth/token"
-def DEFAULT_CLIENT_ID     = "default_client_id"
-def DEFAULT_CLIENT_SECRET = "default_client_secret"
-
-def PROP_TOKEN      = "GLOBAL_ACCESS_TOKEN"
-def PROP_EXPIRES_AT = "GLOBAL_TOKEN_EXPIRES_AT"
+def DEFAULT_TOKEN_URL   = "https://auth.example.com/oauth/token"
+def PROP_TOKEN          = "GLOBAL_ACCESS_TOKEN"
+def PROP_EXPIRES_AT     = "GLOBAL_TOKEN_EXPIRES_AT"
 
 // ============================================================================
-// 2. 高速チェック（ノンブロッキング）
+// 2. 高速チェック（メモリ上の有効期限判定）
 // ============================================================================
 long now = System.currentTimeMillis() / 1000
 String currentToken = props.get(PROP_TOKEN)
 String expiresAtStr = props.get(PROP_EXPIRES_AT)
-long expiresAt = expiresAtStr ? expiresAtStr.toLong() : 0L
+
+String cleanExpiresAt = expiresAtStr ? expiresAtStr.replaceAll("[^0-9]", "") : ""
+long expiresAt = cleanExpiresAt.isLong() ? cleanExpiresAt.toLong() : 0L
 
 if (currentToken != null && now < expiresAt) {
     return
 }
 
 // ============================================================================
-// 3. 排他制御（トークン期限切れ時のみ、全スレッドで1スレッドずつ処理）
+// 3. 排他制御（トークン取得処理）
 // ============================================================================
 synchronized(this.class) {
     
-    // ロック獲得後の二重チェック（Double-Checking Lock）
+    // 二重チェック
     now = System.currentTimeMillis() / 1000
     currentToken = props.get(PROP_TOKEN)
     expiresAtStr = props.get(PROP_EXPIRES_AT)
-    expiresAt = expiresAtStr ? expiresAtStr.toLong() : 0L
+    cleanExpiresAt = expiresAtStr ? expiresAtStr.replaceAll("[^0-9]", "") : ""
+    expiresAt = cleanExpiresAt.isLong() ? cleanExpiresAt.toLong() : 0L
 
     if (currentToken != null && now < expiresAt) {
-        log.info("[OAuth2] 他スレッドによるトークン更新を確認したため、処理をスキップします。")
         return
     }
 
-    log.info("[OAuth2] トークンが未取得または期限切れのため、再取得処理を開始します...")
+    log.info("[OAuth2] CSV / 設定値からエンコード済み認証情報を読み込みます...")
 
-    // ---- パラメータ取得 ----
-    def clientId     = props.get("OAUTH_CLIENT_ID")     ?: vars.get("OAUTH_CLIENT_ID")     ?: DEFAULT_CLIENT_ID
-    def clientSecret = props.get("OAUTH_CLIENT_SECRET") ?: vars.get("OAUTH_CLIENT_SECRET") ?: DEFAULT_CLIENT_SECRET
+    // ★【ポイント①】最初から Base64 エンコードされた認証情報を取得
+    def rawBasicAuth = (vars.get("OAUTH_BASIC_AUTH") ?: props.get("OAUTH_BASIC_AUTH"))?.trim()
+    if (!rawBasicAuth) {
+        log.error("[OAuth2] OAUTH_BASIC_AUTH が設定されていません！")
+        SampleResult.setSuccessful(false)
+        SampleResult.setResponseCode("400")
+        SampleResult.setResponseMessage("OAUTH_BASIC_AUTH が未設定です。")
+        return
+    }
 
-    // FQDN または フルURL の自動判定
-    def rawFqdnOrUrl = props.get("OAUTH_TOKEN_URL") ?: vars.get("FQDN") ?: vars.get("OAUTH_TOKEN_URL") ?: DEFAULT_TOKEN_URL
+    // "Basic " 接頭辞の自動補完
+    def oauthAuthHeader = rawBasicAuth.startsWith("Basic ") ? rawBasicAuth : "Basic " + rawBasicAuth
+
+    // URL / FQDN の取得
+    def rawFqdnOrUrl = (vars.get("FQDN") ?: vars.get("OAUTH_TOKEN_URL") ?: props.get("OAUTH_TOKEN_URL") ?: DEFAULT_TOKEN_URL)?.trim()
     def tokenUrl     = rawFqdnOrUrl.startsWith("http") ? rawFqdnOrUrl : "https://" + rawFqdnOrUrl + "/oauth/token"
 
-    // ---- プロキシ設定の取得（プロパティまたは変数から取得） ----
-    def proxyHost = props.get("PROXY_HOST") ?: vars.get("PROXY_HOST")
-    def proxyPort = props.get("PROXY_PORT") ?: vars.get("PROXY_PORT")
-    def proxyUser = props.get("PROXY_USER") ?: vars.get("PROXY_USER")
-    def proxyPass = props.get("PROXY_PASS") ?: vars.get("PROXY_PASS")
+    // プロキシ設定の取得（プロキシ用の Basic 認証もエンコード済みを受け取り可能）
+    def rawHost        = (vars.get("PROXY_HOST") ?: props.get("PROXY_HOST"))?.trim()
+    def rawPort        = (vars.get("PROXY_PORT") ?: props.get("PROXY_PORT"))?.trim()
+    def rawProxyAuth   = (vars.get("PROXY_BASIC_AUTH") ?: props.get("PROXY_BASIC_AUTH"))?.trim()
+    def proxyAuthHeader = rawProxyAuth ? (rawProxyAuth.startsWith("Basic ") ? rawProxyAuth : "Basic " + rawProxyAuth) : null
 
-    def postBody = "grant_type=client_credentials" +
-                   "&client_id=" + URLEncoder.encode(clientId, "UTF-8") +
-                   "&client_secret=" + URLEncoder.encode(clientSecret, "UTF-8")
+    String finalProxyHost = null
+    int finalProxyPort = -1
+
+    if (rawPort && rawPort.contains(".")) {
+        finalProxyHost = rawPort
+        String digitsOnly = rawHost ? rawHost.replaceAll("[^0-9]", "") : ""
+        if (digitsOnly.isInteger()) finalProxyPort = digitsOnly.toInteger()
+    } else {
+        finalProxyHost = rawHost
+        if (rawPort) {
+            String digitsOnly = rawPort.replaceAll("[^0-9]", "")
+            if (digitsOnly.isInteger()) finalProxyPort = digitsOnly.toInteger()
+        }
+    }
+
+    def postBody = "grant_type=client_credentials"
+
+    log.info("[OAuth2 Target] URL: " + tokenUrl + " | ProxyHost: " + finalProxyHost + " | ProxyPort: " + finalProxyPort)
 
     // ============================================================================
-    // 4. リトライ機能付きトークン取得API呼び出し（プロキシ対応）
+    // 4. トークン取得API呼び出し
     // ============================================================================
-    int maxRetries = 3          // 最大リトライ回数
-    long retryIntervalMs = 2000 // リトライ間隔（ミリ秒）
+    int maxRetries = 3
+    long retryIntervalMs = 2000
     boolean isSuccess = false
 
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            log.info("[OAuth2] トークン取得試行 (" + attempt + "/" + maxRetries + ") -> " + tokenUrl)
+            log.info("[OAuth2] 接続試行 (" + attempt + "/" + maxRetries + ")...")
 
             URL url = new URL(tokenUrl)
             HttpURLConnection connection
 
-            // プロキシの設定判定
-            if (proxyHost && proxyPort) {
-                log.info("[OAuth2] プロキシ経由で接続します: " + proxyHost + ":" + proxyPort)
-                Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyHost, proxyPort.toInteger()))
+            if (finalProxyHost && finalProxyPort > 0) {
+                Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(finalProxyHost, finalProxyPort))
                 connection = (HttpURLConnection) url.openConnection(proxy)
 
-                // プロキシ認証（BASIC認証）が必要な場合
-                if (proxyUser && proxyPass) {
-                    String authStr = proxyUser + ":" + proxyPass
-                    String encodedAuth = Base64.getEncoder().encodeToString(authStr.getBytes("UTF-8"))
-                    connection.setRequestProperty("Proxy-Authorization", "Basic " + encodedAuth)
+                // エンコード済みプロキシ認証ヘッダーをセット
+                if (proxyAuthHeader) {
+                    connection.setRequestProperty("Proxy-Authorization", proxyAuthHeader)
                 }
             } else {
-                // プロキシ指定がない場合は直接接続
                 connection = (HttpURLConnection) url.openConnection()
             }
 
             connection.setRequestMethod("POST")
             connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-            connection.setConnectTimeout(5000) // 接続タイムアウト 5秒
-            connection.setReadTimeout(5000)    // 応答タイムアウト 5秒
+            
+            // ★【ポイント②】そのまま Authorization ヘッダーにセット！
+            connection.setRequestProperty("Authorization", oauthAuthHeader)
+
+            connection.setConnectTimeout(5000)
+            connection.setReadTimeout(5000)
             connection.doOutput = true
 
             connection.outputStream.withWriter("UTF-8") { writer -> writer.write(postBody) }
@@ -105,48 +125,45 @@ synchronized(this.class) {
             if (connection.responseCode == 200) {
                 def json = new JsonSlurper().parseText(connection.inputStream.text)
                 String accessToken = json.access_token
-                long expiresIn = json.expires_in as long
+                
+                long expiresIn = 3600L
+                if (json.expires_in != null) {
+                    String expStr = json.expires_in.toString().replaceAll("[^0-9]", "")
+                    if (expStr.isLong()) expiresIn = expStr.toLong()
+                }
 
-                // 有効期限の5分(300秒)前に切れるよう計算
                 long newExpiresAt = now + expiresIn - 300
 
-                // 成功時のみグローバルプロパティに保存
                 props.put(PROP_TOKEN, accessToken)
                 props.put(PROP_EXPIRES_AT, newExpiresAt.toString())
 
-                log.info("[OAuth2] 新しいアクセストークンの取得・保存に成功しました！")
+                log.info("[OAuth2] ★トークン取得成功！")
                 isSuccess = true
-                break // リトライループ脱出
+                break
             } else {
-                log.warn("[OAuth2] トークン取得失敗: HTTP status " + connection.responseCode)
+                log.warn("[OAuth2] トークン取得失敗: HTTP " + connection.responseCode)
             }
         } catch (Exception e) {
-            log.warn("[OAuth2] トークン取得時の通信例外: " + e.message)
+            log.warn("[OAuth2] 通信例外: " + e.message)
         }
 
         if (!isSuccess && attempt < maxRetries) {
-            log.info("[OAuth2] " + (retryIntervalMs / 1000) + "秒後に再試行します...")
             sleep(retryIntervalMs)
         }
     }
 
     // ============================================================================
-    // 5. リトライ全滅時のフォールバック処理
+    // 5. 失敗時のクリア処理
     // ============================================================================
     if (!isSuccess) {
-        log.error("[OAuth2] " + maxRetries + "回のリトライすべてでトークン取得に失敗しました。")
+        log.error("[OAuth2] トークン取得に失敗しました。誤ったキャッシュを破棄します。")
+        
+        props.remove(PROP_TOKEN)
+        props.remove(PROP_EXPIRES_AT)
 
-        if (currentToken != null) {
-            // 古いトークンがある場合は10秒延命して次回再挑戦
-            long gracePeriod = now + 10
-            props.put(PROP_EXPIRES_AT, gracePeriod.toString())
-            log.warn("[OAuth2] 既存トークンを維持し、10秒後に再度取得を試みます。")
-        } else {
-            // 初回起動時（既存トークンなし）で失敗した場合は JSR223 Sampler 自体をエラー扱いにする
-            SampleResult.setSuccessful(false)
-            SampleResult.setResponseCode("500")
-            SampleResult.setResponseMessage("初回のOAuth2トークン取得に失敗しました。プロキシ設定や認証サーバーを確認してください。")
-        }
+        SampleResult.setSuccessful(false)
+        SampleResult.setResponseCode("500")
+        SampleResult.setResponseMessage("OAuth2トークン取得失敗。OAUTH_BASIC_AUTH やプロキシ設定を確認してください。")
     }
 }
 
