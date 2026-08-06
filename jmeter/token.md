@@ -150,4 +150,91 @@ Test Plan
 
 これで環境を選ばず、保守性も抜群の「OAuth2トークン自動キャッシュ＆使い回し機構」の完成じゃ！
 
+----
+
+もちろんでございます（…ではなく、もちろんであーる！）！それこそまさに共通化・部品化の真骨頂じゃ！
+
+JMeterのプロパティ（`-J` オプション）や変数（`User Defined Variables` 等）からパラメータを受け取りつつ、未指定の場合のみスクリプト内の「初期値（デフォルト値）」を採用するコードに改修できるぞ。
+
+Groovyのエルビス演算子（`?:`）を使えば、**「プロパティ（`-J`） ＞ JMeter変数（`vars`） ＞ 初期値（デフォルト）」** の優先順位で超エレガントに記述できるのじゃ！
+
+---
+
+## パラメータ可変対応版 Groovy コード（抜粋）
+
+前回の Groovy スクリプトの冒頭（`tokenUrl` 等を定義している部分）を以下のように置き換えるのじゃ。
+
+```groovy
+import groovy.json.JsonSlurper
+import java.net.URLEncoder
+
+// ---- 【1. 初期値（デフォルト値）の設定】 ----
+def DEFAULT_TOKEN_URL     = "https://auth.example.com/oauth/token"
+def DEFAULT_CLIENT_ID     = "default_client_id"
+def DEFAULT_CLIENT_SECRET = "default_client_secret"
+
+// ---- 【2. パラメータの取得（優先順: プロパティ -J > JMeter変数 vars > 初期値）】 ----
+def tokenUrl     = props.get("OAUTH_TOKEN_URL")     ?: vars.get("OAUTH_TOKEN_URL")     ?: DEFAULT_TOKEN_URL
+def clientId     = props.get("OAUTH_CLIENT_ID")     ?: vars.get("OAUTH_CLIENT_ID")     ?: DEFAULT_CLIENT_ID
+def clientSecret = props.get("OAUTH_CLIENT_SECRET") ?: vars.get("OAUTH_CLIENT_SECRET") ?: DEFAULT_CLIENT_SECRET
+
+// リクエストボディの組み立て（特殊文字対策としてURLエンコードを実施）
+def postBody = "grant_type=client_credentials" +
+               "&client_id=" + URLEncoder.encode(clientId, "UTF-8") +
+               "&client_secret=" + URLEncoder.encode(clientSecret, "UTF-8")
+
+// ---- 以降は既存の排他制御・リトライ処理 ----
+def PROP_TOKEN = "GLOBAL_ACCESS_TOKEN"
+def PROP_EXPIRES_AT = "GLOBAL_TOKEN_EXPIRES_AT"
+
+long now = System.currentTimeMillis() / 1000
+String currentToken = props.get(PROP_TOKEN)
+String expiresAtStr = props.get(PROP_EXPIRES_AT)
+long expiresAt = expiresAtStr ? expiresAtStr.toLong() : 0L
+
+if (currentToken != null && now < expiresAt) {
+    return
+}
+
+synchronized(this.class) {
+    // （前回の排他制御・リトライ処理へつづく…）
+}
+
+```
+
+---
+
+## 3通りのパラメータ渡しかた
+
+この実装にしておくと、状況に応じて柔軟に接続先やクレデンシャルを変更できるぞ！
+
+### ① 何も指定しない場合（ローカルお試し）
+
+何も渡さなければ自動的に `DEFAULT_TOKEN_URL` や `DEFAULT_CLIENT_ID` の初期値が使われるのじゃ。
+
+### ② JMeter GUI上で変更したい場合 (`User Defined Variables`)
+
+テストプラン直下の `User Defined Variables（ユーザー定義変数）` で以下のように設定すれば、全スレッドでその値が使われるぞ。
+
+* `OAUTH_TOKEN_URL` : `[https://stg-auth.example.com/oauth/token](https://stg-auth.example.com/oauth/token)`
+* `OAUTH_CLIENT_ID` : `stg_client_id`
+* `OAUTH_CLIENT_SECRET` : `stg_secret`
+
+### ③ CI/CDやCLI（コマンドライン）で環境ごとに上書きしたい場合
+
+JMeter起動時の `-J` オプションで外から一発上書きできるのじゃ！
+
+```bash
+# ステージング環境向けにパラメータを渡して実行
+jmeter -n -t scenarios/my_test.jmx \
+  -JOAUTH_TOKEN_URL="https://stg-auth.example.com/oauth/token" \
+  -JOAUTH_CLIENT_ID="stg_app_id" \
+  -JOAUTH_CLIENT_SECRET="stg_app_secret"
+
+```
+
+---
+
+これでお使いの `fragments/get-oauth-token.jmx` は、開発環境・検証環境・本番類似環境のどこへ持っていってもスクリプト本体を一切書き換えずに使い回せる、真の共通モジュールへと進化したぞ！
+
 
