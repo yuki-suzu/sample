@@ -1,115 +1,52 @@
-**その通りじゃ！`opaque-token` 関連の設定や記述は、設定ファイルからも Java コードからも【丸ごと綺麗さっぱり全削除】で問題ないぞ！！**
-
-不透明トークン（REFERENCE）時代に必要だった「イントロスペクション（問い合わせ）用のエンドポイント設定」や「`OpaqueTokenIntrospector`」は、メモリ直結の JWT 自律検証に切り替えることで完全に不要になるのじゃ。
-
-外部 Tomcat（`bootWar`）同居環境を前提とした、**今回の JWT 化に伴う「改修対象ファイル全量」** を頭から順に漏れなく提示するぞ！
+無駄なコードや不要な設定を徹底的に削ぎ落とし、**「Spring Boot 3.2 / Java 21 / PostgreSQL 16 / 外部 Tomcat（`bootWar`）環境」** において、M2M（Client Credentials）認証兼リソースサーバーを完全自律・最速で動かすための **最終確定版（全量）** を提示するぞ！
 
 ---
 
-## 改修ファイル全量マップ
+## 変更内容の全体サマリー
 
-1. **`application.yml`** ── `opaquetoken` 設定の完全削除
-2. **`RegisteredClientConfig.java`** ── `TokenSettings` を `SELF_CONTAINED` へ変更
-3. **`JwkConfig.java`**（★新規または追加） ── 署名鍵とメモリ直結型 `JwtDecoder` の Bean 定義
-4. **`SecurityConfig.java`** ── `opaqueToken()` を `jwt()` へ変更
+| 対象 | 変更内容 | 目的・理由 |
+| --- | --- | --- |
+| **① データベース (SQL)** | `oauth2_registered_client.token_settings` 内の `"reference"` を `"self-contained"` に置換 | クライアント設定を JWT 発行モードに変更 |
+| **② `application.yml**` | `spring.security.oauth2.resourceserver` 関連の設定を**全削除** | メモリ直結検証のため、外部通信用設定は完全不要 |
+| **③ `JwkConfig.java**` | `JWKSource`、`JwtDecoder`、`AuthorizationServerSettings` の Bean 定義 | メモリ上での署名生成と直接検証、認可サーバー標準設定の提供 |
+| **④ `SecurityConfig.java**` | 画面用リダイレクト・`formLogin`・OIDC を全撤廃し、純粋な M2M + JWT 検証に最適化 | 余計なエラーハンドリングやセッション管理を排し、API 仕様（401/403）に準拠 |
 
 ---
 
-### 1. `application.yml`（設定ファイル）
+## 1. データベース（SQL）の変更
 
-**【改修内容】** `resourceserver` に関するブロックを丸ごと削除する。
+`oauth2_registered_client` テーブルの対象レコードについて、`token_settings` カラム内のフォーマット指定を置換するのじゃ。
+
+```sql
+-- 対象の M2M クライアントID を指定して実行
+UPDATE oauth2_registered_client
+SET token_settings = REPLACE(token_settings, '"value":"reference"', '"value":"self-contained"')
+WHERE client_id = 'YOUR_M2M_CLIENT_ID';
+
+-- ※ JSON 内のスペース有無の差異を考慮する場合はこちらも確認
+UPDATE oauth2_registered_client
+SET token_settings = REPLACE(token_settings, '"value": "reference"', '"value": "self-contained"')
+WHERE client_id = 'YOUR_M2M_CLIENT_ID';
+
+```
+
+---
+
+## 2. `application.yml` の変更
+
+`resourceserver` に関連する設定ブロック（`opaquetoken` や `jwt`）は**すべて削除**する。
 
 ```yaml
-# ==============================================================================
-# 修正前：以下の opaquetoken 関連設定を「丸ごと削除」する！
-# spring:
-#   security:
-#     oauth2:
-#       resourceserver:
-#         opaquetoken:
-#           introspection-uri: ...
-#           client-id: ...
-#           client-secret: ...
-# ==============================================================================
-
-# 修正後：同一コンテキスト内のメモリ直結検証を行うため、
-# resourceserver 関連の設定記述は「完全不要（空でOK）」じゃ！
-spring:
-  application:
-    name: auth-resource-app
+# resourceserver に関する外部問い合わせ設定（introspection-uri や jwk-set-uri）は
+# 同一コンテキスト内のメモリ直結検証を行うため、一切の記述が不要！
 
 ```
 
 ---
 
-### 2. `RegisteredClientConfig.java`（クライアント定義）
+## 3. Java 実装コード一式
 
-**【改修内容】** M2M クライアント（Client Credentials）のトークンフォーマットを `SELF_CONTAINED` に切り替える。
-
-```java
-package com.example.config;
-
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.security.oauth2.core.AuthorizationGrantType;
-import org.springframework.security.oauth2.core.ClientAuthenticationMethod;
-import org.springframework.security.oauth2.core.OAuth2TokenFormat;
-import org.springframework.security.oauth2.server.authorization.client.InMemoryRegisteredClientRepository;
-import org.springframework.security.oauth2.server.authorization.client.RegisteredClient;
-import org.springframework.security.oauth2.server.authorization.client.RegisteredClientRepository;
-import org.springframework.security.oauth2.server.authorization.settings.ClientSettings;
-import org.springframework.security.oauth2.server.authorization.settings.TokenSettings;
-
-import java.time.Duration;
-import java.util.UUID;
-
-/**
- * OAuth2 クライアント定義を管理する構成クラス。
- * 
- * <p>M2M（Client Credentials）通信を行うクライアントに対し、
- * 自己完結型 JWT（{@link OAuth2TokenFormat#SELF_CONTAINED}）を発行するよう設定します。</p>
- */
-@Configuration
-public class RegisteredClientConfig {
-
-    /**
-     * OAuth2 登録クライアントのリポジトリを Spring Context に登録します。
-     *
-     * @return 構成済みの {@link RegisteredClientRepository} インスタンス
-     */
-    @Bean
-    public RegisteredClientRepository registeredClientRepository() {
-        // M2M クライアント用のトークン設定
-        TokenSettings tokenSettings = TokenSettings.builder()
-                // ★ REFERENCE から SELF_CONTAINED（JWT）に変更！
-                .accessTokenFormat(OAuth2TokenFormat.SELF_CONTAINED)
-                // JWT は短めの有効期限（15分〜30分程度）を推奨
-                .accessTokenTimeToLive(Duration.ofMinutes(15))
-                .build();
-
-        RegisteredClient m2mClient = RegisteredClient.withId(UUID.randomUUID().toString())
-                .clientId("m2m-client-id")
-                .clientSecret("{noop}m2m-client-secret")
-                .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_BASIC)
-                .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_POST)
-                .authorizationGrantType(AuthorizationGrantType.CLIENT_CREDENTIALS)
-                .scope("api.read")
-                .scope("api.write")
-                .tokenSettings(tokenSettings)
-                .clientSettings(ClientSettings.builder().build())
-                .build();
-
-        return new InMemoryRegisteredClientRepository(m2mClient);
-    }
-}
-
-```
-
----
-
-### 3. `JwkConfig.java`（暗号鍵 ＆ メモリ直結デコーダー）
-
-**【改修内容】** JWT の署名を行う `JWKSource` と、リソースサーバーがネットワーク通信を行わずにメモリ上で直接署名を検証するための `JwtDecoder` を定義する。
+### ① `JwkConfig.java`（暗号鍵・デコーダー・認可サーバー基本構成）
 
 ```java
 package com.example.config;
@@ -123,6 +60,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.server.authorization.config.annotation.web.configuration.OAuth2AuthorizationServerConfiguration;
+import org.springframework.security.oauth2.server.authorization.settings.AuthorizationServerSettings;
 
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -131,18 +69,18 @@ import java.security.interfaces.RSAPublicKey;
 import java.util.UUID;
 
 /**
- * 認可サーバーの JWT 署名鍵およびリソースサーバーの検証デコーダーを構成するクラス。
+ * 認可サーバーおよびリソースサーバー向けの暗号鍵、JWT デコーダー、基本プロトコル設定を統括する構成クラス。
  * 
- * <p>同一 JVM（外部Tomcat環境）内で認可サーバーとリソースサーバーが同居する構成において、
- * HTTP 経由の JWK 取得を排し、メモリ上で直接 JWT 署名を検証する {@link JwtDecoder} を提供します。</p>
+ * <p>同一 JVM 内での稼働を前提とし、外部 Tomcat デプロイ時でもネットワーク通信（HTTP による公開鍵取得）を
+ * 発生させずに、メモリ上で直接 JWT 署名検証を行う {@link JwtDecoder} を Spring コンテキストに提供します。</p>
  */
 @Configuration
 public class JwkConfig {
 
     /**
-     * JWT アクセストークンの電子署名（RS256）処理を行う {@link JWKSource} を登録します。
+     * JWT の電子署名および公開鍵情報配信を担う {@link JWKSource} を登録します。
      *
-     * @return 不変の {@link JWKSet} を内包する {@link JWKSource} インスタンス
+     * @return RSA キーペアを保持する不変の {@link JWKSource} インスタンス
      */
     @Bean
     public JWKSource<SecurityContext> jwkSource() {
@@ -159,10 +97,10 @@ public class JwkConfig {
     }
 
     /**
-     * リソースサーバー向けのメモリ直結型 {@link JwtDecoder} を登録します。
+     * リソースサーバーがメモリ上で JWT を直接検証するための {@link JwtDecoder} を登録します。
      * 
-     * <p>同一コンテキスト内の {@link JWKSource} を直接参照してデコーダーを生成するため、
-     * 外部 Tomcat のポート番号やコンテキストパスの変更に影響されず、自律的かつ高速に検証を実行します。</p>
+     * <p>同一コンテキスト内の {@link JWKSource} を直接参照するため、HTTP 通信（ポートや URL 設定）を
+     * 一切行わずに、高速かつ確実に署名検証を実行します。</p>
      *
      * @param jwkSource 署名鍵を提供する {@link JWKSource}
      * @return メモリ参照型の {@link JwtDecoder} インスタンス
@@ -173,10 +111,20 @@ public class JwkConfig {
     }
 
     /**
+     * 認可サーバーの標準エンドポイントおよびプロトコル構成（{@link AuthorizationServerSettings}）を登録します。
+     *
+     * @return デフォルト構成の {@link AuthorizationServerSettings} インスタンス
+     */
+    @Bean
+    public AuthorizationServerSettings authorizationServerSettings() {
+        return AuthorizationServerSettings.builder().build();
+    }
+
+    /**
      * RSA 2048bit の暗号鍵ペアを新規生成します。
      *
-     * @return 生成された {@link KeyPair}
-     * @throws IllegalStateException キーペアの生成処理に失敗した場合
+     * @return 生成された {@link KeyPair}（公開鍵および秘密鍵）
+     * @throws IllegalStateException キーペアの初期化・生成処理に失敗した場合
      */
     private static KeyPair generateRsaKeyPair() {
         try {
@@ -193,9 +141,9 @@ public class JwkConfig {
 
 ---
 
-### 4. `SecurityConfig.java`（セキュリティフィルター構成）
+### ② `SecurityConfig.java`（M2M 特化セキュリティフィルターチェーン）
 
-**【改修内容】** リソースサーバー側の設定を `.opaqueToken(...)` から `.jwt(Customizer.withDefaults())` に切り替える。
+画面遷移用のコード（`formLogin` や `LoginUrlAuthenticationEntryPoint` 等）をすべて排除した、純粋な API / M2M 構成じゃ。
 
 ```java
 package com.example.config;
@@ -203,28 +151,32 @@ package com.example.config;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
-import org.springframework.http.MediaType;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.oauth2.server.authorization.config.annotation.web.configurers.OAuth2AuthorizationServerConfigurer;
 import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
-import org.springframework.security.web.util.matcher.MediaTypeRequestMatcher;
 
 /**
- * 認可サーバー兼リソースサーバーのセキュリティフィルターチェーンを統括する設定クラス。
+ * M2M（Client Credentials）通信専用の認可サーバー兼リソースサーバー向けセキュリティフィルターチェーン設定クラス。
+ * 
+ * <p>ブラウザ向けのログイン画面遷移やセッション管理を排し、ステートレスな API 認可制御と
+ * 自己完結型 JWT（{@code SELF_CONTAINED}）の自律検証を構成します。</p>
  */
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
 
     /**
-     * 認可サーバーのエンドポイント群（/oauth2/token 等）を保護・構成するフィルターチェーン。
+     * 認可サーバー機能（{@code /oauth2/token} 等のエンドポイント）を提供するフィルターチェーンを構築します。
+     * 
+     * <p>Client Credentials グラント等のトークン発行要求を処理し、認証失敗時は HTTP 401 を返却します。</p>
      *
      * @param http セキュリティ構成ビルダー {@link HttpSecurity}
-     * @return 認可サーバー用 {@link SecurityFilterChain}
-     * @throws Exception 構成中にエラーが発生した場合
+     * @return 構築された認可サーバー用 {@link SecurityFilterChain}
+     * @throws Exception フィルターチェーン構築中に例外が発生した場合
      */
     @Bean
     @Order(1)
@@ -234,49 +186,43 @@ public class SecurityConfig {
 
         http
             .securityMatcher(authorizationServerConfigurer.getEndpointsMatcher())
-            .with(authorizationServerConfigurer, authorizationServer ->
-                authorizationServer.oidc(Customizer.withDefaults())
-            )
+            .with(authorizationServerConfigurer, Customizer.withDefaults())
             .authorizeHttpRequests(authorize -> authorize
                 .anyRequest().authenticated()
-            )
-            .exceptionHandling(exceptions -> exceptions
-                .defaultAuthenticationEntryPointFor(
-                    new LoginUrlAuthenticationEntryPoint("/login"),
-                    new MediaTypeRequestMatcher(MediaType.TEXT_HTML)
-                )
             );
 
         return http.build();
     }
 
     /**
-     * 業務 API（リソースサーバー）および一般 Web リクエストを保護するフィルターチェーン。
+     * リソースサーバー機能（業務 API エンドポイント保護）を提供するフィルターチェーンを構築します。
      * 
-     * <p>HTTP ヘッダーに付与された Bearer JWT トークンを {@link JwkConfig} で登録された
-     * {@link org.springframework.security.oauth2.jwt.JwtDecoder} によりメモリ上で直接検証します。</p>
+     * <p>{@link JwkConfig} で登録された {@link org.springframework.security.oauth2.jwt.JwtDecoder}
+     * を用いて Bearer JWT トークンをメモリ上で直接検証します。また、API に不要な CSRF およびセッション生成を無効化します。</p>
      *
      * @param http セキュリティ構成ビルダー {@link HttpSecurity}
-     * @return API保護用 {@link SecurityFilterChain}
-     * @throws Exception 構成中にエラーが発生した場合
+     * @return 構築されたリソースサーバー用 {@link SecurityFilterChain}
+     * @throws Exception フィルターチェーン構築中に例外が発生した場合
      */
     @Bean
     @Order(2)
     public SecurityFilterChain defaultSecurityFilterChain(HttpSecurity http) throws Exception {
         http
+            // API のため CSRF を無効化
+            .csrf(AbstractHttpConfigurer::disable)
+            // ステートレスなセッション管理
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            )
             .authorizeHttpRequests(authorize -> authorize
-                .requestMatchers("/api/public/**", "/login", "/error").permitAll()
+                .requestMatchers("/api/public/**").permitAll()
                 .requestMatchers("/api/**").authenticated()
                 .anyRequest().authenticated()
             )
-            // =================================================================
-            // 修正前：.oauth2ResourceServer(oauth2 -> oauth2.opaqueToken(...))
-            // 修正後：以下の 1行にするだけでメモリ直結の JwtDecoder が自動適用される！
-            // =================================================================
+            // JWT 自律検証を有効化（JwkConfig の JwtDecoder が自動適用される）
             .oauth2ResourceServer(oauth2 -> oauth2
                 .jwt(Customizer.withDefaults())
-            )
-            .formLogin(Customizer.withDefaults());
+            );
 
         return http.build();
     }
@@ -286,13 +232,13 @@ public class SecurityConfig {
 
 ---
 
-## 改修後の動作フロー
+## 最終チェック・確認ポイント
 
-1. **トークン発行時**
-クライアントが `/oauth2/token`（Client Credentials）を叩くと、認可サーバーが `JwkConfig` の秘密鍵で電子署名した **JWT 文字列** を即座に返却。
-2. **API 呼び出し時**
-クライアントが `Authorization: Bearer <JWT>` を付けて `/api/data` を呼ぶ。
-3. **署名検証時（★超高速・通信ゼロ）**
-リソースサーバーは `JwkConfig` でメモリ上に直結された `jwtDecoder` を使い、**HTTP 通信も DB 参照も一切行わずにメモリ上で瞬時に署名＆有効期限を検証** して API を実行！
+1. **一切の無駄・ゴミ設定を排除**
+画面ログイン用の `LoginUrlAuthenticationEntryPoint`、`formLogin()`、`MediaTypeRequestMatcher`、OIDC 設定はすべて完全撤去した。
+2. **外部 Tomcat（WAR）の環境非依存**
+URL やポート番号の指定がコード・設定ファイルから一切消えたため、Tomcat 側のポート変更やコンテキストパス変更にびくともしない。
+3. **DB I/O の削減**
+API 呼び出し時の `oauth2_authorization` テーブルへの SELECT（トークン問い合わせ）が完全ゼロになり、大幅なスループット向上が得られる。
 
-これで、外部 Tomcat のポート番号や URL に一切悩まされることなく、無駄な通信と DB 負荷を極限まで削ぎ落とした最速構成の完成じゃ！
+これで完璧な布陣じゃ！迷わずこの構成で進めておくれ！
