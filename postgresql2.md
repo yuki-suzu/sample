@@ -115,22 +115,35 @@ CREATE TABLE public.pref_data_new (
 
 ```sql
 /**
- * 子パーティション単位で「新パーティション作成 → データ直接ストリーム投入 → 旧パーティション即削除 → リネーム → CHECKPOINT」
- * を実行するローリング移行用SQLの自動生成クエリ
+ * 旧親テーブルの既存カラム一覧をシステムカタログから自動取得し、
+ * 新規追加カラムには新テーブル側の DEFAULT 値（またはNULL）が自動適用される形で
+ * 子パーティション単位のローリング移行SQLを自動生成するクエリ（カラム手書き不要版）
  *
  * @param target_schema   対象スキーマ名
  * @param old_parent_name 現行の親テーブル名
- * @param new_parent_name Step 1で作成した新親テーブルの仮名（インデックス・PKなしの状態）
- * @param select_clause   新親テーブルのカラム並び順に合わせたSELECT句（追加カラムの初期値・型キャストを含む）
+ * @param new_parent_name 新しく作成した親テーブルの仮名（新カラムにDEFAULT定義済みの状態）
  * @return パーティションごとの移行ステップSQL（件数の少ない順）
  */
 WITH params AS (
     SELECT 
         'public'::text            AS target_schema,
         'pref_data'::text         AS old_parent_name,
-        'pref_data_new'::text     AS new_parent_name,
-        -- ★新テーブルのカラム並び順に合わせたSELECT句（新規追加項目は初期値またはNULLを明示的に配置）
-        'id, pref_code, ''INIT''::varchar(50) AS new_col, user_name, created_at'::text AS select_clause
+        'pref_data_new'::text     AS new_parent_name
+        -- ★ SELECT句の手書き指定は不要！旧親テーブルのカラムを自動抽出します
+),
+-- 旧親テーブルから既存の全カラム名（生成列を除く）を定義順でカンマ区切り取得
+old_columns AS (
+    SELECT 
+        string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum) AS col_list
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid
+    CROSS JOIN params p
+    WHERE n.nspname = p.target_schema
+      AND c.relname = p.old_parent_name
+      AND a.attnum > 0 
+      AND NOT a.attisdropped
+      AND a.attgenerated = '' -- GENERATED ALWAYS AS の計算列は自動除外
 ),
 partitions AS (
     SELECT 
@@ -147,7 +160,6 @@ partitions AS (
     CROSS JOIN params p
     WHERE nmsp_parent.nspname = p.target_schema
       AND parent.relname = p.old_parent_name
-    -- 小さいパーティションで動作検証できるよう件数昇順（ASC）で出力（最大3000万件を最初に片付けたい場合は DESC に変更）
     ORDER BY child.reltuples ASC, child.relname
 )
 SELECT 
@@ -156,14 +168,14 @@ $SQL$-- =================================================================
 -- パーティション移行: %1$I.%2$I (概算: %7$s 件)
 -- =================================================================
 BEGIN;
--- WALフラッシュ待ちを省略して高速化（万が一OSクラッシュしても当該パーティションからやり直せるため安全）
 SET LOCAL synchronous_commit = off;
 
--- 1. 新しい子パーティションを作成（親にPK/Indexが無いため、ここでも一切作られず一瞬で完了）
+-- 1. 新しい子パーティションを作成（親テーブルのDEFAULT定義も自動で引き継がれる）
 CREATE TABLE %1$I.%3$I PARTITION OF %1$I.%4$I %5$s;
 
--- 2. 旧子パーティションから直接ストリーム投入（親のルーティング負荷ゼロ・メモリ消費は数MBのみ）
-INSERT INTO %1$I.%3$I SELECT %6$s FROM %1$I.%2$I;
+-- 2. 旧テーブルに存在するカラムだけを指定してINSERT（新カラムは指定しないため自動的にDEFAULT値が入る！）
+INSERT INTO %1$I.%3$I (%6$s)
+SELECT %6$s FROM %1$I.%2$I;
 
 -- 3. 移行が終わった旧子パーティションを即座にDROPして物理ディスク領域を解放
 DROP TABLE %1$I.%2$I;
@@ -172,7 +184,6 @@ DROP TABLE %1$I.%2$I;
 ALTER TABLE %1$I.%3$I RENAME TO %2$I;
 COMMIT;
 
--- ★3,000万件規模のWALファイルを即座にリサイクル可能にするためチェックポイントを実行
 CHECKPOINT;
 $SQL$,
         pt.child_schema,
@@ -180,11 +191,12 @@ $SQL$,
         pt.new_child_name,
         p.new_parent_name,
         pt.part_bound_expr,
-        p.select_clause,
+        oc.col_list,
         to_char(GREATEST(pt.est_rows, 0), 'FM999,999,999,999')
     ) AS rolling_migration_sql
 FROM partitions pt
-CROSS JOIN params p;
+CROSS JOIN params p
+CROSS JOIN old_columns oc;
 ```
 
 ---
